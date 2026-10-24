@@ -1,0 +1,47 @@
+# Backend on Render's free web service.
+# Dashboard order: Neon database first, then this service, then Cloudflare R2 keys, then the frontend on Vercel.
+# Secrets with sync:false are filled in the Render dashboard (they are not in git).
+services:
+  - type: web
+    name: slack-analyze-api
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install --include=dev && npm run build && npm prune --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SSL
+        value: "true"
+      - key: INGEST_API_KEY
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: none
+      - key: TRUST_PROXY
+        value: "true"
+      - key: FILE_STORAGE
+        value: s3
+      - key: FILE_STORAGE_DIR
+        value: /tmp/slack-files
+      - key: FILE_MAX_MB
+        value: "100"
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        value: auto
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_FORCE_PATH_STYLE
+        value: "false"
+      - key: S3_PREFIX
+        value: slack-files/

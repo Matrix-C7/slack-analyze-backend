@@ -1,0 +1,30 @@
+{
+  // Ctrl+Shift+P -> "Tasks: Run Task" -> "dev: backend" (starts the database first)
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev: db",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/dev-db.ps1"],
+      "presentation": { "panel": "dedicated", "reveal": "silent" },
+      "problemMatcher": []
+    },
+    {
+      "label": "dev: backend",
+      "type": "shell",
+      "command": "npm run dev",
+      "options": {
+        "env": {
+          "PORT": "4000",
+          "DATABASE_URL": "postgres://slack:change-me@127.0.0.1:5433/slack_analyze",
+          "INGEST_API_KEY": "change-me-too"
+        }
+      },
+      "dependsOn": "dev: db",
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "group": "dev" },
+      "problemMatcher": []
+    }
+  ]
+}
