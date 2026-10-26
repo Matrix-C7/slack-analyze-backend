@@ -2,7 +2,17 @@
 # Safe to run when it is already up.
 $ErrorActionPreference = 'Stop'
 
-$pgBin = 'C:\Program Files\PostgreSQL\18\bin'
+$pgRoot = 'C:\Program Files\PostgreSQL'
+$verDir = Get-ChildItem $pgRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^\d+$' -and (Test-Path (Join-Path $_.FullName 'bin\initdb.exe')) } |
+    Sort-Object { [int]$_.Name } -Descending |
+    Select-Object -First 1
+if (-not $verDir) {
+    Write-Error "PostgreSQL is not installed under $pgRoot"
+    exit 1
+}
+$pgBin = Join-Path $verDir.FullName 'bin'
+Write-Host "Using PostgreSQL $($verDir.Name) at $pgBin"
 $root = Split-Path -Parent $PSScriptRoot
 $data = Join-Path $root '.pgdata'
 

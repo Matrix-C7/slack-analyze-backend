@@ -28,7 +28,7 @@ Clone them side by side (`slack-analyze-backend`, `slack-analyze-frontend`, `sla
 
 ## Quick start (Windows, no Docker)
 
-Needs Node 22 and PostgreSQL 18 installed (`C:\Program Files\PostgreSQL\18\bin`).
+Needs Node 22 and PostgreSQL 17 or 18 installed (`C:\Program Files\PostgreSQL\<version>\bin`). The database script uses the newest installed version.
 
 ```powershell
 npm install

@@ -51,6 +51,8 @@ const commandCreate = z.discriminatedUnion('type', [
         autoIntervalMinutes: z.number().int().min(5).max(1440),
         incremental: z.boolean(),
         liveCapture: z.boolean(),
+        keepSlackActive: z.boolean(),
+        keepSlackActiveMinutes: z.number().int().min(1).max(60),
         captureThreads: z.boolean(),
         verifyPass: z.boolean(),
         loadPatienceSec: z.number().int().min(10).max(600),
