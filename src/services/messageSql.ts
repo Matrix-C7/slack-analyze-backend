@@ -1,7 +1,10 @@
 /** Shared SELECT list for message rows returned to the frontend (alias `m` = messages, `c` = channels). */
 export const MESSAGE_COLUMNS = `
   m.id, m.workspace_id, m.channel_id, c.name AS channel_name, c.type AS channel_type,
-  m.ts, m.sent_at, m.user_id, m.user_name, m.text, m.thread_ts, m.reply_count,
+  m.ts, m.sent_at, m.user_id,
+  -- live capture often stores the user id only; the name captured earlier still applies
+  COALESCE(m.user_name, u.display_name, u.real_name) AS user_name,
+  m.text, m.thread_ts, m.reply_count,
   m.is_edited, m.is_bot, m.subtype, m.has_files,
   COALESCE(m.raw->>'avatarUrl', u.avatar_url) AS avatar_url,
   COALESCE((SELECT json_agg(json_build_object('emoji', r.emoji, 'count', r.count) ORDER BY r.count DESC, r.emoji)

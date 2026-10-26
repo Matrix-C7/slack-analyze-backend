@@ -87,8 +87,11 @@ export async function analyticsRoutes(app: FastifyInstance) {
         params,
       ),
       pool.query(
-        `SELECT m.user_id AS id, max(m.user_name) AS name, count(*) AS messages, count(DISTINCT m.channel_id) AS channels
-         FROM messages m ${where} AND m.user_id IS NOT NULL GROUP BY 1 ORDER BY messages DESC LIMIT 15`,
+        `SELECT m.user_id AS id, max(COALESCE(m.user_name, u.display_name, u.real_name)) AS name,
+                count(*) AS messages, count(DISTINCT m.channel_id) AS channels
+         FROM messages m
+         LEFT JOIN slack_users u ON u.workspace_id = m.workspace_id AND u.id = m.user_id
+         ${where} AND m.user_id IS NOT NULL GROUP BY 1 ORDER BY messages DESC LIMIT 15`,
         params,
       ),
       pool.query(

@@ -158,6 +158,28 @@ export interface IngestResult {
   filesPending: number;
 }
 
+/**
+ * Live socket messages usually carry a user id and no display name.
+ * Use the name already learned from an earlier capture of that person.
+ */
+async function fillSenderNames(db: pg.PoolClient, workspaceId: string, messages: MessageInput[]): Promise<MessageInput[]> {
+  const ids = [...new Set(messages.flatMap((m) => (m.userId && !m.userName ? [m.userId] : [])))];
+  if (!ids.length) return messages;
+  const { rows } = await db.query<{ id: string; name: string; avatar_url: string | null }>(
+    `SELECT id, COALESCE(display_name, real_name) AS name, avatar_url FROM slack_users
+     WHERE workspace_id = $1 AND id = ANY($2::text[]) AND COALESCE(display_name, real_name) IS NOT NULL`,
+    [workspaceId, ids],
+  );
+  if (!rows.length) return messages;
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  return messages.map((m) => {
+    if (m.userName || !m.userId) return m;
+    const u = byId.get(m.userId);
+    if (!u) return m;
+    return { ...m, userName: u.name, avatarUrl: m.avatarUrl || u.avatar_url || null };
+  });
+}
+
 /** Real-time messages carry mentions as "@U0123"; swap in the names we know so stored text reads like Slack. */
 async function nameMentions(db: pg.PoolClient, workspaceId: string, messages: MessageInput[]): Promise<MessageInput[]> {
   const ids = [...new Set(messages.flatMap((m) => m.mentions ?? []))];
@@ -198,6 +220,7 @@ export async function ingestMessages(body: IngestMessagesBody): Promise<IngestRe
     const deleted = new Set(tomb.map((r) => r.ts));
     const keepAfter = ctl[0]?.retention_days ? Date.now() / 1000 - ctl[0].retention_days * 86400 : 0;
     let messages = body.messages.filter((m) => !deleted.has(m.ts) && Number(m.ts) >= keepAfter);
+    messages = await fillSenderNames(db, workspace.id, messages);
     if (body.origin === 'rtm') messages = await nameMentions(db, workspace.id, messages);
 
     const sorted = [...messages].sort((a, b) => Number(a.ts) - Number(b.ts));
@@ -311,6 +334,14 @@ export async function ingestMessages(body: IngestMessagesBody): Promise<IngestRe
            updated_at    = now()`,
         [workspace.id, id, u.name, u.avatar, u.isBot, u.first, u.last],
       );
+      // Older live rows for this person may have been stored before we knew the name.
+      if (u.name && !id.startsWith('name:')) {
+        await db.query(
+          `UPDATE messages SET user_name = $3, updated_at = now()
+           WHERE workspace_id = $1 AND user_id = $2 AND user_name IS NULL`,
+          [workspace.id, id, u.name],
+        );
+      }
     }
 
     // Sync bookkeeping. Slack ts strings are fixed-width, so text comparison orders them correctly.

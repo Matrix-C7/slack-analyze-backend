@@ -86,7 +86,7 @@ export async function searchRoutes(app: FastifyInstance) {
         filterParams,
       ),
       pool.query(
-        `SELECT m.user_id AS id, max(m.user_name) AS name, count(*) AS n ${MESSAGE_FROM} ${whereSql}
+        `SELECT m.user_id AS id, max(COALESCE(m.user_name, u.display_name, u.real_name)) AS name, count(*) AS n ${MESSAGE_FROM} ${whereSql}
          GROUP BY 1 ORDER BY n DESC LIMIT 20`,
         filterParams,
       ),

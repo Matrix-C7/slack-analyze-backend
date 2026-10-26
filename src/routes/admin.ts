@@ -735,10 +735,12 @@ export async function adminRoutes(app: FastifyInstance) {
     for (;;) {
       const { rows } = await pool.query(
         `SELECT m.id, m.workspace_id, m.channel_id, c.name AS channel_name, c.type AS channel_type, m.ts, m.sent_at, m.thread_ts,
-                m.user_id, m.user_name, m.text, m.reply_count, m.is_edited, m.is_bot,
+                m.user_id, COALESCE(m.user_name, su.display_name, su.real_name) AS user_name, m.text, m.reply_count, m.is_edited, m.is_bot,
                 (SELECT string_agg(r.emoji || ':' || r.count, ' ') FROM message_reactions r WHERE r.message_id = m.id) AS reactions,
                 (SELECT string_agg(f.url, ' ') FROM message_files f WHERE f.message_id = m.id) AS files
-         FROM messages m JOIN channels c ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
+         FROM messages m
+         JOIN channels c ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
+         LEFT JOIN slack_users su ON su.workspace_id = m.workspace_id AND su.id = m.user_id
          WHERE m.workspace_id = $1 AND ($2::text IS NULL OR m.channel_id = $2)
            AND ($3::date IS NULL OR m.sent_at >= $3::date) AND ($4::date IS NULL OR m.sent_at < $4::date + 1)
            AND m.id > $5
