@@ -31,6 +31,37 @@ const channelNameSql = (acct: string) => `
     END,
     c.name)`;
 
+/**
+ * People a DM or group DM is named after, with their Slack photo when we have one.
+ * The sidebar name is already "Kamil" or "Kamil, renato"; match each part to slack_users.
+ */
+const channelPeersSql = (acct: string) => `
+  CASE WHEN c.type IN ('dm', 'group_dm') THEN COALESCE((
+    SELECT json_agg(json_build_object('name', p.name, 'avatarUrl', p.avatar_url) ORDER BY p.name)
+    FROM (
+      SELECT DISTINCT ON (lower(btrim(part)))
+             COALESCE(su.display_name, su.real_name, btrim(part)) AS name,
+             su.avatar_url
+      FROM unnest(string_to_array(${channelNameSql(acct)}, ',')) AS part
+      LEFT JOIN slack_users su
+        ON su.workspace_id = c.workspace_id
+       AND (lower(su.display_name) = lower(btrim(part)) OR lower(COALESCE(su.real_name, '')) = lower(btrim(part)))
+      WHERE btrim(part) <> ''
+      ORDER BY lower(btrim(part)), (su.avatar_url IS NULL), su.id
+    ) p
+  ), '[]'::json) ELSE '[]'::json END`;
+
+/** Messages this dashboard user has not opened yet. No read cursor means the whole history is unread. */
+const unreadCountSql = (userParam: string) => `
+  (SELECT count(*) FROM messages m
+   WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id
+     AND NOT EXISTS (
+       SELECT 1 FROM channel_reads cr
+       WHERE cr.app_user_id = ${userParam}::bigint
+         AND cr.workspace_id = c.workspace_id AND cr.channel_id = c.id
+         AND cr.last_read_ts IS NOT NULL
+         AND m.ts::numeric <= cr.last_read_ts::numeric))`;
+
 /** Accounts that can see a conversation, as [{ id, name }]. Accounts hidden by an admin are left out for viewers. */
 const channelAccountsSql = (req: FastifyRequest) => `
   COALESCE((SELECT json_agg(json_build_object('id', a.user_id, 'name', COALESCE(a.display_name, su.display_name, a.user_id))
@@ -115,6 +146,8 @@ export async function readRoutes(app: FastifyInstance) {
     const { rows } = await pool.query(
       `SELECT c.id, ${channelNameSql('$2')} AS name, c.type, c.topic, c.is_archived, c.is_hidden, c.reached_start, c.last_synced_at,
               COALESCE(s.message_count, 0) AS message_count, s.first_message_at, s.last_message_at,
+              ${unreadCountSql('$3')} AS unread_count,
+              ${channelPeersSql('$2')} AS peers,
               ${channelAccountsSql(req)} AS accounts
        FROM channels c
        LEFT JOIN (
@@ -126,7 +159,7 @@ export async function readRoutes(app: FastifyInstance) {
                SELECT 1 FROM channel_accounts ca
                WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ca.account_user_id = $2))
        ORDER BY lower(c.name)`,
-      [workspaceId, accountId],
+      [workspaceId, accountId, req.user!.id],
     );
     return rows.map((r) => ({
       id: r.id,
@@ -138,6 +171,8 @@ export async function readRoutes(app: FastifyInstance) {
       reachedStart: r.reached_start,
       lastSyncedAt: r.last_synced_at,
       messageCount: r.message_count,
+      unreadCount: Number(r.unread_count),
+      peers: r.peers ?? [],
       firstMessageAt: r.first_message_at,
       lastMessageAt: r.last_message_at,
       accounts: r.accounts,
@@ -149,7 +184,8 @@ export async function readRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const { workspaceId, channelId } = req.params;
       const { rows } = await pool.query(
-        `SELECT c.id, ${channelNameSql('$3')} AS name, c.type, ${channelAccountsSql(req)} AS accounts, c.topic, c.reached_start, c.last_synced_at,
+        `SELECT c.id, ${channelNameSql('$3')} AS name, c.type, ${channelAccountsSql(req)} AS accounts,
+                ${channelPeersSql('$3')} AS peers, c.topic, c.reached_start, c.last_synced_at,
                 (SELECT count(*) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS message_count,
                 (SELECT count(DISTINCT user_id) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS member_count,
                 (SELECT min(sent_at) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS first_message_at
@@ -168,8 +204,43 @@ export async function readRoutes(app: FastifyInstance) {
         messageCount: r.message_count,
         memberCount: r.member_count,
         firstMessageAt: r.first_message_at,
+        peers: r.peers ?? [],
         accounts: r.accounts,
       };
+    },
+  );
+
+  /** Remember that this dashboard user has seen messages through `ts` (or the newest message we hold). */
+  app.post<{ Params: { workspaceId: string; channelId: string } }>(
+    '/channels/:workspaceId/:channelId/read',
+    async (req, reply) => {
+      const { workspaceId, channelId } = req.params;
+      const { ts } = z.object({ ts: tsParam.optional() }).parse(req.body ?? {});
+      const visible = await pool.query(
+        `SELECT 1 FROM channels c WHERE c.workspace_id = $1 AND c.id = $2 AND ${visibleSql(req, 'c.workspace_id', 'c.id')}`,
+        [workspaceId, channelId],
+      );
+      if (!visible.rows[0]) return reply.code(404).send({ error: 'channel not found' });
+
+      const cursor = ts ?? (
+        await pool.query<{ ts: string | null }>(
+          'SELECT max(ts) AS ts FROM messages WHERE workspace_id = $1 AND channel_id = $2',
+          [workspaceId, channelId],
+        )
+      ).rows[0]?.ts;
+      if (!cursor) return { ok: true };
+
+      await pool.query(
+        `INSERT INTO channel_reads (app_user_id, workspace_id, channel_id, last_read_ts)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (app_user_id, workspace_id, channel_id) DO UPDATE
+           SET last_read_ts = CASE
+                 WHEN channel_reads.last_read_ts IS NULL OR EXCLUDED.last_read_ts::numeric > channel_reads.last_read_ts::numeric
+                 THEN EXCLUDED.last_read_ts ELSE channel_reads.last_read_ts END,
+               updated_at = now()`,
+        [req.user!.id, workspaceId, channelId, cursor],
+      );
+      return { ok: true };
     },
   );
 
