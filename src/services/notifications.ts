@@ -48,6 +48,7 @@ export async function buildNotification(body: IngestMessagesBody, fresh: NewMess
     channelName: ctx[0].channel_name,
     channelType: ctx[0].type,
     channelHidden: ctx[0].is_hidden,
+    accountId,
     messages: messages.map((m) => {
       const u = m.userId ? byId.get(m.userId) : undefined;
       return {

@@ -23,6 +23,8 @@ export interface NotificationEvent {
   channelName: string;
   channelType: string;
   channelHidden: boolean; // admin-hidden conversations only reach admins
+  /** Slack account whose browser captured these messages. */
+  accountId: string | null;
   messages: {
     ts: string;
     threadTs: string | null;
