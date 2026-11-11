@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import { requireUser, visibleSql } from '../auth.js';
-import { pool } from '../db/pool.js';
+import { and, requireUser, visibleFilter } from '../auth.js';
+import { col } from '../db/mongo.js';
 import { type ByteRange, fileStore } from '../services/fileStore.js';
 
 /** Types a browser would run as a page or script if opened inline: always served as a download. */
@@ -35,15 +35,9 @@ export async function fileRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string }; Querystring: { download?: string } }>('/files/:id/content', async (req, reply) => {
     const id = Number(req.params.id);
     if (!Number.isSafeInteger(id) || id <= 0) return reply.code(400).send({ error: 'invalid file id' });
-    const { rows } = await pool.query(
-      `SELECT f.name, COALESCE(b.mime_type, f.mime_type) AS mime_type, b.sha256, b.size_bytes, b.storage, b.storage_key
-       FROM message_files f
-       JOIN messages m ON m.id = f.message_id
-       JOIN file_blobs b ON b.sha256 = f.blob_sha256
-       WHERE f.id = $1 AND f.status = 'stored' AND ${visibleSql(req, 'm.workspace_id', 'm.channel_id')}`,
-      [id],
-    );
-    const f = rows[0];
+    const row = await col.messageFiles.findOne(and({ id, status: 'stored' }, await visibleFilter(req)));
+    const blob = row?.blob_sha256 ? await col.fileBlobs.findOne({ sha256: row.blob_sha256 }) : null;
+    const f = row && blob ? { name: row.name, mime_type: blob.mime_type ?? row.mime_type, sha256: blob.sha256, size_bytes: blob.size_bytes, storage: blob.storage, storage_key: blob.storage_key } : null;
     if (!f) return reply.code(404).send({ error: 'file not archived' });
     if (f.storage !== fileStore.name) {
       return reply.code(503).send({ error: `file is kept in "${f.storage}" storage, but the server runs with FILE_STORAGE=${fileStore.name}` });

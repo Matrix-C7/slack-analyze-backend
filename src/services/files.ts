@@ -4,18 +4,18 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type pg from 'pg';
+import type { Document } from 'mongodb';
 import { config } from '../config.js';
-import { pool } from '../db/pool.js';
+import { col, nextId } from '../db/mongo.js';
 import type { FileInput } from '../schemas.js';
-import { blobKey, fileStore, tempDir } from './fileStore.js';
+import { fileStore, tempDir } from './fileStore.js';
 
 /** A collector holds a claimed file this long before another browser may take it over. */
-const LEASE = `interval '10 minutes'`;
+const LEASE_MS = 10 * 60_000;
 /** After this many failed downloads a file is marked failed (an admin can retry it). */
 export const MAX_ATTEMPTS = 6;
 /** Blobs nobody references are kept this long before cleanup, so an upload in flight is never collected. */
-const ORPHAN_GRACE = `interval '1 hour'`;
+const ORPHAN_GRACE_MS = 3600_000;
 
 export const FILE_KINDS = ['image', 'video', 'pdf', 'doc', 'other'] as const;
 
@@ -72,66 +72,90 @@ function normalize(workspaceId: string, f: FileInput): NormalizedFile {
 /**
  * Records one file of a message. The same file arrives from the DOM (permalink, preview image) and from the
  * real-time feed (url_private, size, type), so rows are matched on the Slack file id and merged.
+ * Workspace, channel and the message's time are copied onto the file so the download queue needs no join.
  * Returns true when the file still needs downloading.
  */
-export async function upsertMessageFile(db: pg.PoolClient, workspaceId: string, messageId: number, input: FileInput): Promise<boolean> {
-  const f = normalize(workspaceId, input);
+export async function upsertMessageFile(
+  msg: { workspaceId: string; channelId: string; messageId: number; sentAt: Date },
+  input: FileInput,
+): Promise<boolean> {
+  const f = normalize(msg.workspaceId, input);
   const hasSource = Boolean(f.downloadUrl || f.thumbUrl);
-  const { rows: found } = await db.query<{ id: number }>(
-    `SELECT id FROM message_files
-     WHERE message_id = $1 AND (slack_file_id = $2 OR url = $3)
-     ORDER BY (slack_file_id = $2) DESC NULLS LAST, id LIMIT 1`,
-    [messageId, f.slackFileId, f.url],
-  );
+  const candidates = await col.messageFiles
+    .find({ message_id: msg.messageId, $or: [...(f.slackFileId ? [{ slack_file_id: f.slackFileId }] : []), { url: f.url }] })
+    .sort({ id: 1 })
+    .toArray();
+  const found = candidates.find((c) => f.slackFileId && c.slack_file_id === f.slackFileId) ?? candidates[0];
 
-  let row: { id: number; status: string; slack_file_id: string | null };
-  if (found[0]) {
-    const { rows } = await db.query(
-      `UPDATE message_files SET
-         name          = COALESCE($2, name),
-         slack_file_id = COALESCE(slack_file_id, $3),
-         download_url  = CASE WHEN $4::boolean THEN $5 ELSE COALESCE(download_url, $5) END,
-         thumb_url     = COALESCE($6, thumb_url),
-         mime_type     = COALESCE($7, mime_type),
-         size_bytes    = COALESCE($8, size_bytes),
-         kind          = CASE WHEN kind IS NULL OR kind = 'other' THEN $9 ELSE kind END,
-         -- A richer capture can make a skipped file downloadable, or give a failed one a better URL.
-         status        = CASE WHEN status = 'skipped' AND $10::boolean THEN 'pending'
-                              WHEN status = 'failed' AND $4::boolean AND download_url IS DISTINCT FROM $5 THEN 'pending'
-                              ELSE status END,
-         attempts      = CASE WHEN status IN ('skipped', 'failed') AND $10::boolean THEN 0 ELSE attempts END
-       WHERE id = $1
-       RETURNING id, status, slack_file_id`,
-      [found[0].id, f.name, f.slackFileId, f.explicitDownload, f.downloadUrl, f.thumbUrl, f.mimeType, f.sizeBytes, f.kind, hasSource],
-    );
-    row = rows[0];
+  let row: Document;
+  if (found) {
+    const downloadUrl = f.explicitDownload ? f.downloadUrl : (found.download_url ?? f.downloadUrl);
+    let status = found.status;
+    let attempts = found.attempts ?? 0;
+    // A richer capture can make a skipped file downloadable, or give a failed one a better URL.
+    if (status === 'skipped' && hasSource) status = 'pending';
+    else if (status === 'failed' && f.explicitDownload && found.download_url !== f.downloadUrl) status = 'pending';
+    if ((found.status === 'skipped' || found.status === 'failed') && hasSource) attempts = 0;
+    const set = {
+      name: f.name ?? found.name ?? null,
+      slack_file_id: found.slack_file_id ?? f.slackFileId,
+      download_url: downloadUrl,
+      thumb_url: f.thumbUrl ?? found.thumb_url ?? null,
+      mime_type: f.mimeType ?? found.mime_type ?? null,
+      size_bytes: f.sizeBytes ?? found.size_bytes ?? null,
+      kind: !found.kind || found.kind === 'other' ? f.kind : found.kind,
+      status,
+      attempts,
+    };
+    await col.messageFiles.updateOne({ id: found.id }, { $set: set });
+    row = { ...found, ...set };
   } else {
-    const { rows } = await db.query(
-      `INSERT INTO message_files (message_id, name, url, kind, slack_file_id, download_url, thumb_url, mime_type, size_bytes, status, last_error)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING id, status, slack_file_id`,
-      [
-        messageId, f.name, f.url, f.kind, f.slackFileId, f.downloadUrl, f.thumbUrl, f.mimeType, f.sizeBytes,
-        hasSource ? 'pending' : 'skipped',
-        hasSource ? null : 'no downloadable source',
-      ],
-    );
-    row = rows[0];
+    row = {
+      id: await nextId('message_files'),
+      message_id: msg.messageId,
+      workspace_id: msg.workspaceId,
+      channel_id: msg.channelId,
+      sent_at: msg.sentAt,
+      name: f.name,
+      url: f.url,
+      kind: f.kind,
+      slack_file_id: f.slackFileId,
+      download_url: f.downloadUrl,
+      thumb_url: f.thumbUrl,
+      mime_type: f.mimeType,
+      size_bytes: f.sizeBytes,
+      status: hasSource ? 'pending' : 'skipped',
+      variant: null,
+      blob_sha256: null,
+      attempts: 0,
+      last_error: hasSource ? null : 'no downloadable source',
+      next_attempt_at: null,
+      leased_by: null,
+      lease_until: null,
+      stored_at: null,
+      created_at: new Date(),
+    };
+    await col.messageFiles.insertOne(row);
   }
   if (row.status !== 'pending') return false;
 
   // Already archived from another message (same file shared twice, or edited message): reuse the blob.
   if (row.slack_file_id) {
-    const { rowCount } = await db.query(
-      `UPDATE message_files f SET status = 'stored', blob_sha256 = s.blob_sha256, variant = s.variant, stored_at = now(),
-              last_error = NULL, leased_by = NULL, lease_until = NULL
-       FROM (SELECT o.blob_sha256, o.variant FROM message_files o JOIN messages om ON om.id = o.message_id
-             WHERE o.slack_file_id = $2 AND om.workspace_id = $3 AND o.status = 'stored'
-             ORDER BY (o.variant = 'original') DESC LIMIT 1) s
-       WHERE f.id = $1`,
-      [row.id, row.slack_file_id, workspaceId],
-    );
-    if (rowCount) return false;
+    const [src] = await col.messageFiles
+      .aggregate([
+        { $match: { workspace_id: msg.workspaceId, slack_file_id: row.slack_file_id, status: 'stored' } },
+        { $addFields: { _orig: { $cond: [{ $eq: ['$variant', 'original'] }, 0, 1] } } },
+        { $sort: { _orig: 1 } },
+        { $limit: 1 },
+      ])
+      .toArray();
+    if (src) {
+      await col.messageFiles.updateOne(
+        { id: row.id },
+        { $set: { status: 'stored', blob_sha256: src.blob_sha256, variant: src.variant, stored_at: new Date(), last_error: null, leased_by: null, lease_until: null } },
+      );
+      return false;
+    }
   }
   return true;
 }
@@ -159,39 +183,58 @@ export async function claimFiles(opts: {
   maxBytes: number;
   limit: number;
 }): Promise<ClaimedFile[]> {
-  const { rows } = await pool.query(
-    `WITH picked AS (
-       SELECT f.id, m.sent_at FROM message_files f
-       JOIN messages m ON m.id = f.message_id
-       JOIN channels c ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
-       WHERE m.workspace_id = $1 AND f.status = 'pending'
-         AND (f.next_attempt_at IS NULL OR f.next_attempt_at <= now())
-         AND (f.lease_until IS NULL OR f.lease_until < now())
-         AND COALESCE(f.kind, 'other') = ANY($4::text[])
-         AND (f.size_bytes IS NULL OR f.size_bytes <= $5 OR f.thumb_url IS NOT NULL)
-         AND NOT c.capture_excluded
-         AND ($3::text IS NULL OR EXISTS (
-               SELECT 1 FROM channel_accounts ca
-               WHERE ca.workspace_id = m.workspace_id AND ca.channel_id = m.channel_id AND ca.account_user_id = $3))
-       ORDER BY m.sent_at DESC
-       LIMIT $6
-       FOR UPDATE OF f SKIP LOCKED)
-     UPDATE message_files f SET leased_by = $2, lease_until = now() + ${LEASE}
-     FROM picked WHERE f.id = picked.id
-     RETURNING f.id, f.name, f.kind, f.download_url, f.thumb_url, f.mime_type, f.size_bytes, picked.sent_at`,
-    [opts.workspaceId, opts.collectorId, opts.accountUserId, opts.kinds, opts.maxBytes, opts.limit],
-  );
-  // UPDATE … RETURNING does not keep the CTE's order.
-  rows.sort((a, b) => b.sent_at - a.sent_at);
-  return rows.map((r) => ({
-    id: Number(r.id),
-    name: r.name,
-    kind: r.kind ?? 'other',
-    downloadUrl: r.download_url,
-    thumbUrl: r.thumb_url,
-    mimeType: r.mime_type,
-    size: r.size_bytes,
-  }));
+  const now = new Date();
+  const [excluded, linked] = await Promise.all([
+    col.channels.distinct('id', { workspace_id: opts.workspaceId, capture_excluded: true }),
+    opts.accountUserId ? col.channelAccounts.distinct('channel_id', { workspace_id: opts.workspaceId, account_user_id: opts.accountUserId }) : null,
+  ]);
+  const claimable = {
+    status: 'pending',
+    $and: [
+      { $or: [{ next_attempt_at: null }, { next_attempt_at: { $lte: now } }] },
+      { $or: [{ lease_until: null }, { lease_until: { $lt: now } }] },
+    ],
+  };
+  // A missing kind counts as 'other'.
+  const kindFilter = opts.kinds.includes('other') ? { $or: [{ kind: { $in: opts.kinds } }, { kind: null }] } : { kind: { $in: opts.kinds } };
+  const channelFilter: Document = linked ? { channel_id: { $in: linked.filter((id) => !excluded.includes(id)) } } : { channel_id: { $nin: excluded } };
+  const candidates = await col.messageFiles
+    .find({
+      workspace_id: opts.workspaceId,
+      ...channelFilter,
+      status: 'pending',
+      $and: [
+        ...claimable.$and,
+        kindFilter,
+        // Too big for the original and no preview to fall back to: nothing this browser could fetch.
+        { $nor: [{ size_bytes: { $gt: opts.maxBytes }, thumb_url: null }] },
+      ],
+    })
+    .sort({ sent_at: -1 })
+    .limit(opts.limit * 4)
+    .toArray();
+
+  // Lease one by one: a file another browser took a moment ago is simply skipped (like SKIP LOCKED).
+  const out: ClaimedFile[] = [];
+  for (const c of candidates) {
+    if (out.length >= opts.limit) break;
+    const leased = await col.messageFiles.findOneAndUpdate(
+      { id: c.id, ...claimable },
+      { $set: { leased_by: opts.collectorId, lease_until: new Date(Date.now() + LEASE_MS) } },
+      { returnDocument: 'after' },
+    );
+    if (!leased) continue;
+    out.push({
+      id: leased.id,
+      name: leased.name ?? null,
+      kind: leased.kind ?? 'other',
+      downloadUrl: leased.download_url ?? null,
+      thumbUrl: leased.thumb_url ?? null,
+      mimeType: leased.mime_type ?? null,
+      size: leased.size_bytes ?? null,
+    });
+  }
+  return out;
 }
 
 export class UploadError extends Error {
@@ -232,7 +275,7 @@ async function spool(body: Readable): Promise<{ tempPath: string; sha256: string
 }
 
 /** A failed download often returns Slack's sign-in page with status 200 instead of the file. */
-function looksLikeHtmlPage(head: Buffer, f: { name: string | null; mime_type: string | null }): boolean {
+function looksLikeHtmlPage(head: Buffer, f: { name?: string | null; mime_type?: string | null }): boolean {
   if (/html/i.test(f.mime_type ?? '') || /\.html?$/i.test(f.name ?? '')) return false;
   return /^\s*(<!doctype html|<html)/i.test(head.toString('utf8'));
 }
@@ -246,12 +289,7 @@ export async function storeUpload(
   body: Readable,
   opts: { variant: 'original' | 'preview'; mimeType: string | null },
 ): Promise<{ sha256: string; size: number; deduplicated: boolean; alreadyStored: boolean }> {
-  const { rows } = await pool.query(
-    `SELECT f.id, f.name, f.mime_type, f.status, f.slack_file_id, f.blob_sha256, m.workspace_id
-     FROM message_files f JOIN messages m ON m.id = f.message_id WHERE f.id = $1`,
-    [fileId],
-  );
-  const f = rows[0];
+  const f = await col.messageFiles.findOne({ id: fileId });
   if (!f) {
     body.resume();
     throw new UploadError(404, 'file not found (message deleted?)');
@@ -265,31 +303,46 @@ export async function storeUpload(
   let deduplicated = false;
   try {
     if (size === 0) throw new UploadError(422, 'empty file');
-    if (looksLikeHtmlPage(head, f)) throw new UploadError(422, 'received an HTML page instead of the file (Slack session expired?)');
+    if (looksLikeHtmlPage(head, { name: f.name, mime_type: f.mime_type })) throw new UploadError(422, 'received an HTML page instead of the file (Slack session expired?)');
     const mimeType = opts.mimeType || f.mime_type || null;
 
-    const { rowCount: exists } = await pool.query('SELECT 1 FROM file_blobs WHERE sha256 = $1', [sha256]);
-    if (exists) {
+    if (await col.fileBlobs.findOne({ sha256 }, { projection: { _id: 1 } })) {
       deduplicated = true;
       await fs.rm(tempPath, { force: true });
     } else {
-      const key = blobKey(sha256);
-      await fileStore.put(key, tempPath, { size, mimeType });
-      await pool.query(
-        `INSERT INTO file_blobs (sha256, size_bytes, mime_type, storage, storage_key) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (sha256) DO NOTHING`,
-        [sha256, size, mimeType, fileStore.name, key],
+      const key = await fileStore.put(sha256, tempPath, { size, mimeType });
+      const res = await col.fileBlobs.updateOne(
+        { sha256 },
+        { $setOnInsert: { sha256, size_bytes: size, mime_type: mimeType, storage: fileStore.name, storage_key: key, created_at: new Date() } },
+        { upsert: true },
       );
+      // Two browsers uploaded the same bytes at once: keep the first copy.
+      if (!res.upsertedCount && fileStore.name === 'gdrive') await fileStore.delete(key).catch(() => {});
     }
     // A preview never replaces an archived original.
-    await pool.query(
-      `UPDATE message_files f SET status = 'stored', blob_sha256 = $2, variant = $3, stored_at = now(),
-              mime_type = COALESCE(f.mime_type, $4), last_error = NULL, leased_by = NULL, lease_until = NULL, next_attempt_at = NULL
-       FROM messages m
-       WHERE m.id = f.message_id
-         AND (f.id = $1 OR ($5::text IS NOT NULL AND f.slack_file_id = $5 AND m.workspace_id = $6))
-         AND (f.status <> 'stored' OR (f.variant = 'preview' AND $3 = 'original'))`,
-      [fileId, sha256, opts.variant, mimeType, f.slack_file_id, f.workspace_id],
+    const sameFile = f.slack_file_id ? [{ workspace_id: f.workspace_id, slack_file_id: f.slack_file_id }] : [];
+    await col.messageFiles.updateMany(
+      {
+        $and: [
+          { $or: [{ id: fileId }, ...sameFile] },
+          { $or: [{ status: { $ne: 'stored' } }, ...(opts.variant === 'original' ? [{ variant: 'preview' }] : [])] },
+        ],
+      },
+      [
+        {
+          $set: {
+            status: 'stored',
+            blob_sha256: sha256,
+            variant: opts.variant,
+            stored_at: '$$NOW',
+            mime_type: { $ifNull: ['$mime_type', { $literal: mimeType }] },
+            last_error: null,
+            leased_by: null,
+            lease_until: null,
+            next_attempt_at: null,
+          },
+        },
+      ],
     );
   } finally {
     await fs.rm(tempPath, { force: true }).catch(() => {});
@@ -302,40 +355,42 @@ export async function storeUpload(
  * MAX_ATTEMPTS; `skip` marks files deliberately not archived (too large, type turned off).
  */
 export async function reportFileFailure(fileId: number, opts: { error: string; retryable: boolean; skip: boolean }): Promise<string | null> {
-  const { rows } = await pool.query<{ status: string }>(
-    `UPDATE message_files SET
-       attempts        = attempts + CASE WHEN $4 THEN 0 ELSE 1 END,
-       last_error      = $2,
-       leased_by       = NULL,
-       lease_until     = NULL,
-       status          = CASE WHEN $4 THEN 'skipped'
-                              WHEN NOT $3 OR attempts + 1 >= ${MAX_ATTEMPTS} THEN 'failed'
-                              ELSE 'pending' END,
-       next_attempt_at = now() + make_interval(mins => LEAST(power(2, attempts + 1), 720)::int)
-     WHERE id = $1 AND status = 'pending'
-     RETURNING status`,
-    [fileId, opts.error.slice(0, 1000), opts.retryable, opts.skip],
+  const next = { $add: ['$attempts', 1] };
+  const doc = await col.messageFiles.findOneAndUpdate(
+    { id: fileId, status: 'pending' },
+    [
+      {
+        $set: {
+          attempts: opts.skip ? '$attempts' : next,
+          last_error: { $literal: opts.error.slice(0, 1000) },
+          leased_by: null,
+          lease_until: null,
+          status: opts.skip
+            ? 'skipped'
+            : { $cond: [{ $or: [{ $literal: !opts.retryable }, { $gte: [next, MAX_ATTEMPTS] }] }, 'failed', 'pending'] },
+          next_attempt_at: { $add: ['$$NOW', { $multiply: [{ $min: [{ $pow: [2, next] }, 720] }, 60_000] }] },
+        },
+      },
+    ],
+    { returnDocument: 'after' },
   );
-  return rows[0]?.status ?? null;
+  return doc?.status ?? null;
 }
 
 /** Deletes blobs no message refers to any more (messages deleted, purged or expired by retention). */
 export async function collectOrphanBlobs(log: { info: (o: object, m: string) => void; warn: (o: object, m: string) => void }) {
-  const { rows } = await pool.query<{ sha256: string; storage: string; storage_key: string }>(
-    `SELECT b.sha256, b.storage, b.storage_key FROM file_blobs b
-     WHERE b.created_at < now() - ${ORPHAN_GRACE}
-       AND NOT EXISTS (SELECT 1 FROM message_files f WHERE f.blob_sha256 = b.sha256)
-     LIMIT 500`,
-  );
+  const old = await col.fileBlobs
+    .find({ created_at: { $lt: new Date(Date.now() - ORPHAN_GRACE_MS) } }, { projection: { sha256: 1, storage: 1, storage_key: 1 } })
+    .toArray();
+  const used = new Set(await col.messageFiles.distinct('blob_sha256', { blob_sha256: { $in: old.map((b) => b.sha256) } }));
   let removed = 0;
-  for (const b of rows) {
+  for (const b of old.filter((x) => !used.has(x.sha256)).slice(0, 500)) {
     if (b.storage !== fileStore.name) continue; // written under another driver: leave it to that configuration
     try {
+      // Re-check right before deleting: a new message may have picked the blob up meanwhile.
+      if (await col.messageFiles.findOne({ blob_sha256: b.sha256 }, { projection: { _id: 1 } })) continue;
       await fileStore.delete(b.storage_key);
-      await pool.query(
-        'DELETE FROM file_blobs b WHERE sha256 = $1 AND NOT EXISTS (SELECT 1 FROM message_files f WHERE f.blob_sha256 = b.sha256)',
-        [b.sha256],
-      );
+      await col.fileBlobs.deleteOne({ sha256: b.sha256 });
       removed++;
     } catch (err) {
       log.warn({ err, sha256: b.sha256 }, 'deleting orphaned file failed');

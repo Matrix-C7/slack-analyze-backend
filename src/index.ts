@@ -2,8 +2,7 @@ import cors from '@fastify/cors';
 import Fastify from 'fastify';
 import { ZodError } from 'zod';
 import { config } from './config.js';
-import { runMigrations } from './db/migrate.js';
-import { pool } from './db/pool.js';
+import { client, db, ensureIndexes } from './db/mongo.js';
 import { adminRoutes } from './routes/admin.js';
 import { analyticsRoutes } from './routes/analytics.js';
 import { authRoutes } from './routes/auth.js';
@@ -31,7 +30,7 @@ app.setErrorHandler((err, _req, reply) => {
 });
 
 app.get('/health', async () => {
-  await pool.query('SELECT 1');
+  await db.command({ ping: 1 });
   return { ok: true };
 });
 
@@ -44,7 +43,9 @@ await app.register(analyticsRoutes, { prefix: '/api' });
 await app.register(streamRoutes, { prefix: '/api' });
 await app.register(fileRoutes, { prefix: '/api' });
 
-await runMigrations(config.migrationsDir, app.log);
+await client.connect();
+await ensureIndexes();
+app.log.info({ db: config.mongodbDb }, 'MongoDB ready');
 
 app.log.info({ storage: fileStore.name, maxMb: Math.round(config.files.maxBytes / 1048576) }, 'file archive ready');
 // Hourly: remove archived files no message refers to any more (deleted, purged, retention).
@@ -54,7 +55,7 @@ gcTimer.unref();
 const shutdown = async () => {
   clearInterval(gcTimer);
   await app.close();
-  await pool.end();
+  await client.close();
   process.exit(0);
 };
 process.on('SIGTERM', shutdown);

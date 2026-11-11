@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import type { FastifyReply, FastifyRequest } from 'fastify';
-import type pg from 'pg';
+import type { Document } from 'mongodb';
 import { config } from './config.js';
-import { pool } from './db/pool.js';
+import { col, nextId } from './db/mongo.js';
 
 const scrypt = promisify(crypto.scrypt) as (pw: string, salt: Buffer, len: number) => Promise<Buffer>;
 
@@ -12,15 +12,22 @@ const SESSION_DAYS = 14;
 
 export type Role = 'admin' | 'viewer';
 
+export interface AccountGrant {
+  workspaceId: string;
+  accountId: string;
+}
+
 export interface SessionUser {
   id: number;
   email: string;
   name: string | null;
   role: Role;
-  /** false: only the workspaces granted in app_user_workspaces are visible (ignored for admins). */
+  /** false: only the workspaces in `workspaceIds` are visible (ignored for admins). */
   allWorkspaces: boolean;
-  /** false: only the Slack accounts granted in app_user_accounts are visible (ignored for admins). */
+  /** false: only the Slack accounts in `accountGrants` are visible (ignored for admins). */
   allAccounts: boolean;
+  workspaceIds: string[];
+  accountGrants: AccountGrant[];
 }
 
 declare module 'fastify' {
@@ -69,20 +76,42 @@ function cookieHeader(value: string, maxAgeSec: number): string {
   return attrs.join('; ');
 }
 
+/** app_users document → session user. */
+export function toSessionUser(u: Document): SessionUser {
+  return {
+    id: Number(u.id),
+    email: u.email,
+    name: u.name ?? null,
+    role: u.role,
+    allWorkspaces: u.all_workspaces !== false,
+    allAccounts: u.all_accounts !== false,
+    workspaceIds: u.workspace_ids ?? [],
+    accountGrants: u.account_grants ?? [],
+  };
+}
+
+/** What /api/auth/me returns (the grant lists stay server-side). */
+export const publicUser = ({ workspaceIds: _w, accountGrants: _a, ...u }: SessionUser) => u;
+
 export async function createSession(req: FastifyRequest, reply: FastifyReply, userId: number): Promise<void> {
   const token = crypto.randomBytes(32).toString('base64url');
-  await pool.query(
-    `INSERT INTO app_sessions (token_hash, user_id, user_agent, ip, expires_at)
-     VALUES ($1, $2, $3, $4, now() + make_interval(days => $5))`,
-    [sha256(token), userId, req.headers['user-agent']?.slice(0, 300) ?? null, req.ip, SESSION_DAYS],
-  );
-  await pool.query('UPDATE app_users SET last_login_at = now() WHERE id = $1', [userId]);
+  const now = new Date();
+  await col.appSessions.insertOne({
+    token_hash: sha256(token),
+    user_id: userId,
+    user_agent: req.headers['user-agent']?.slice(0, 300) ?? null,
+    ip: req.ip,
+    created_at: now,
+    last_used_at: now,
+    expires_at: new Date(now.getTime() + SESSION_DAYS * 86400_000),
+  });
+  await col.appUsers.updateOne({ id: userId }, { $set: { last_login_at: now } });
   reply.header('Set-Cookie', cookieHeader(token, SESSION_DAYS * 86400));
 }
 
 export async function destroySession(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   const token = readCookie(req, SESSION_COOKIE);
-  if (token) await pool.query('DELETE FROM app_sessions WHERE token_hash = $1', [sha256(token)]);
+  if (token) await col.appSessions.deleteOne({ token_hash: sha256(token) });
   reply.header('Set-Cookie', cookieHeader('', 0));
 }
 
@@ -90,17 +119,13 @@ export async function destroySession(req: FastifyRequest, reply: FastifyReply): 
 export async function loadUser(req: FastifyRequest): Promise<SessionUser | undefined> {
   const token = readCookie(req, SESSION_COOKIE);
   if (!token) return undefined;
-  const { rows } = await pool.query(
-    `UPDATE app_sessions s SET last_used_at = now()
-     FROM app_users u
-     WHERE s.token_hash = $1 AND s.expires_at > now() AND u.id = s.user_id AND u.is_active
-     RETURNING u.id, u.email, u.name, u.role, u.all_workspaces, u.all_accounts`,
-    [sha256(token)],
+  const s = await col.appSessions.findOneAndUpdate(
+    { token_hash: sha256(token), expires_at: { $gt: new Date() } },
+    { $set: { last_used_at: new Date() } },
   );
-  const r = rows[0];
-  return r
-    ? { id: Number(r.id), email: r.email, name: r.name, role: r.role, allWorkspaces: r.all_workspaces, allAccounts: r.all_accounts }
-    : undefined;
+  if (!s) return undefined;
+  const u = await col.appUsers.findOne({ id: s.user_id, is_active: true });
+  return u ? toSessionUser(u) : undefined;
 }
 
 /** onRequest hook: any logged-in user. */
@@ -121,39 +146,52 @@ export const isAdmin = (req: FastifyRequest) => req.user?.role === 'admin';
 /** True when the user sees every workspace (admins, and viewers with "all communities"). */
 const seesAllWorkspaces = (req: FastifyRequest) => isAdmin(req) || req.user?.allWorkspaces !== false;
 
-/**
- * SQL condition limiting rows to the workspaces (communities) the user may see. `ws` is the SQL expression for
- * the workspace id (e.g. "m.workspace_id"). The user id is a number from the session, so inlining it is safe.
- */
-export function workspaceSql(req: FastifyRequest, ws: string): string {
-  if (seesAllWorkspaces(req)) return 'true';
-  return `${ws} IN (SELECT aw.workspace_id FROM app_user_workspaces aw WHERE aw.user_id = ${Number(req.user!.id)})`;
+/** Filter limiting documents to the workspaces (communities) the user may see. `field` holds the workspace id. */
+export function workspaceFilter(req: FastifyRequest, field = 'workspace_id'): Document {
+  if (seesAllWorkspaces(req)) return {};
+  return { [field]: { $in: req.user!.workspaceIds } };
 }
 
 /** Whether the user may see one workspace (for routes addressed by workspace id). */
-export async function canSeeWorkspace(req: FastifyRequest, workspaceId: string): Promise<boolean> {
-  if (seesAllWorkspaces(req)) return true;
-  const { rowCount } = await pool.query('SELECT 1 FROM app_user_workspaces WHERE user_id = $1 AND workspace_id = $2', [
-    req.user!.id,
-    workspaceId,
-  ]);
-  return Boolean(rowCount);
+export function canSeeWorkspace(req: FastifyRequest, workspaceId: string): boolean {
+  return seesAllWorkspaces(req) || req.user!.workspaceIds.includes(workspaceId);
 }
 
-/** Workspace ids the user may see, or null for all of them. */
+/** Workspace ids the user may see, or null for all of them. Re-read from the database (for long-lived streams). */
 export async function visibleWorkspaceIds(req: FastifyRequest): Promise<Set<string> | null> {
   if (seesAllWorkspaces(req)) return null;
-  const { rows } = await pool.query('SELECT workspace_id FROM app_user_workspaces WHERE user_id = $1', [req.user!.id]);
-  return new Set(rows.map((r) => r.workspace_id as string));
+  const u = await col.appUsers.findOne({ id: req.user!.id }, { projection: { all_workspaces: 1, workspace_ids: 1 } });
+  if (u && u.all_workspaces !== false) return null;
+  return new Set<string>(u?.workspace_ids ?? []);
 }
 
 /**
- * SQL condition hiding admin-hidden conversations and communities the user has no access to. `ws` / `ch` are the
- * SQL expressions for the workspace and channel id (e.g. "m.workspace_id", "m.channel_id"). Admins see everything.
+ * Filter hiding admin-hidden conversations and communities the user has no access to, for documents that carry
+ * workspace_id and channel_id (messages, files, channel_accounts). Admins see everything.
  */
-export function visibleSql(req: FastifyRequest, ws: string, ch: string): string {
-  if (isAdmin(req)) return 'true';
-  return `${workspaceSql(req, ws)} AND NOT EXISTS (SELECT 1 FROM channels hc WHERE hc.workspace_id = ${ws} AND hc.id = ${ch} AND hc.is_hidden)`;
+export async function visibleFilter(req: FastifyRequest): Promise<Document> {
+  if (isAdmin(req)) return {};
+  const hidden = await col.channels.find({ is_hidden: true }, { projection: { _id: 0, workspace_id: 1, id: 1 } }).toArray();
+  const f: Document = { ...workspaceFilter(req) };
+  if (hidden.length) f.$nor = hidden.map((h) => ({ workspace_id: h.workspace_id, channel_id: h.id }));
+  return f;
+}
+
+/** Filter for the channels collection itself (its own id field is `id`). */
+export function visibleChannelFilter(req: FastifyRequest): Document {
+  if (isAdmin(req)) return {};
+  return { ...workspaceFilter(req), is_hidden: { $ne: true } };
+}
+
+/**
+ * Whether an account (accounts document, or null when there is none) is visible to this user — not hidden from
+ * all viewers, and granted to this user when they only see selected accounts. A missing account passes.
+ */
+export function accountVisible(req: FastifyRequest, a: { workspace_id: string; user_id: string; is_hidden?: boolean } | null | undefined): boolean {
+  if (isAdmin(req) || !a) return true;
+  if (a.is_hidden) return false;
+  if (req.user?.allAccounts !== false) return true;
+  return req.user.accountGrants.some((g) => g.workspaceId === a.workspace_id && g.accountId === a.user_id);
 }
 
 /** Stands in for an account a viewer may not browse as: matches no channel_accounts row, so results come back empty. */
@@ -166,36 +204,35 @@ const NO_ACCOUNT = '#hidden-account'; // never a Slack user id
 export async function viewableAccountId(req: FastifyRequest, accountId: string | null | undefined): Promise<string | null> {
   if (!accountId) return null;
   if (isAdmin(req)) return accountId;
-  const { rowCount } = await pool.query(`SELECT 1 FROM accounts a WHERE a.user_id = $1 AND NOT (${accountVisibleSql(req)})`, [accountId]);
-  return rowCount ? NO_ACCOUNT : accountId;
+  const accounts = await col.accounts.find({ user_id: accountId }).toArray();
+  return accounts.some((a) => !accountVisible(req, a as never)) ? NO_ACCOUNT : accountId;
 }
 
-/**
- * SQL condition: the account alias `a` (accounts, possibly from a LEFT JOIN) is visible to this user — not hidden
- * from all viewers, and granted to this user when they only see selected accounts. Rows with no account pass.
- * The user id is a number from the session, so inlining it is safe.
- */
-export function accountVisibleSql(req: FastifyRequest, alias = 'a'): string {
-  if (isAdmin(req)) return 'true';
-  const notHidden = `${alias}.is_hidden IS NOT TRUE`;
-  if (req.user?.allAccounts !== false) return notHidden;
-  return `(${alias}.user_id IS NULL OR (${notHidden} AND EXISTS (
-    SELECT 1 FROM app_user_accounts ua
-    WHERE ua.user_id = ${Number(req.user.id)} AND ua.workspace_id = ${alias}.workspace_id AND ua.account_user_id = ${alias}.user_id)))`;
+/** Restricts documents with workspace_id/channel_id to conversations the given account can see. */
+export async function accountScopeFilter(accountId: string): Promise<Document> {
+  const links = await col.channelAccounts
+    .find({ account_user_id: accountId }, { projection: { _id: 0, workspace_id: 1, channel_id: 1 } })
+    .toArray();
+  if (!links.length) return { _id: { $exists: false } }; // matches nothing
+  const byWs = new Map<string, string[]>();
+  for (const l of links) byWs.set(l.workspace_id, [...(byWs.get(l.workspace_id) ?? []), l.channel_id]);
+  return { $or: [...byWs].map(([ws, ids]) => ({ workspace_id: ws, channel_id: { $in: ids } })) };
 }
 
-export async function audit(
-  req: FastifyRequest,
-  action: string,
-  target: string | null,
-  details?: Record<string, unknown>,
-  db: pg.Pool | pg.PoolClient = pool,
-): Promise<void> {
-  await db.query('INSERT INTO audit_log (user_id, user_email, action, target, details) VALUES ($1, $2, $3, $4, $5)', [
-    req.user?.id ?? null,
-    req.user?.email ?? null,
+/** AND of several filters, dropping empty ones. */
+export function and(...filters: Document[]): Document {
+  const parts = filters.filter((f) => Object.keys(f).length);
+  return parts.length === 0 ? {} : parts.length === 1 ? parts[0] : { $and: parts };
+}
+
+export async function audit(req: FastifyRequest, action: string, target: string | null, details?: Record<string, unknown>): Promise<void> {
+  await col.auditLog.insertOne({
+    id: await nextId('audit_log'),
+    user_id: req.user?.id ?? null,
+    user_email: req.user?.email ?? null,
     action,
     target,
-    details ?? null,
-  ]);
+    details: details ?? null,
+    created_at: new Date(),
+  });
 }

@@ -1,13 +1,15 @@
 import type { FastifyInstance } from 'fastify';
-import type pg from 'pg';
+import type { Document } from 'mongodb';
 import { z } from 'zod';
 import { audit, hashPassword, requireAdmin } from '../auth.js';
 import { config } from '../config.js';
-import { pool, withTransaction } from '../db/pool.js';
+import { col, db, deleteChannelData, deleteMessages, isDuplicateKey, nextId } from '../db/mongo.js';
 import { fileStore } from '../services/fileStore.js';
+import { lookupMap } from '../services/messages.js';
 import { passwordSchema } from './auth.js';
+import { isOnline, ONLINE_MS } from './read.js';
 
-const ONLINE_WINDOW = `interval '3 minutes'`;
+const DAY_MS = 86_400_000;
 
 const fileRetryBody = z.object({ status: z.enum(['failed', 'skipped']) });
 
@@ -79,65 +81,50 @@ const exportQuery = z.object({
   format: z.enum(['json', 'csv']).default('json'),
 });
 
-const toUser = (r: Record<string, unknown>) => ({
-  id: Number(r.id),
-  email: r.email,
-  name: r.name,
-  role: r.role,
-  isActive: r.is_active,
-  lastLoginAt: r.last_login_at,
-  createdAt: r.created_at,
-  activeSessions: r.active_sessions ?? 0,
-  allWorkspaces: r.all_workspaces ?? true,
-  workspaceIds: (r.workspace_ids as string[] | undefined) ?? [],
-  allAccounts: r.all_accounts ?? true,
-  accounts: (r.account_grants as { workspaceId: string; accountId: string }[] | undefined) ?? [],
-});
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+const lower = (s: unknown) => String(s ?? '').toLowerCase();
+const k2 = (a: string, b: string) => `${a}\u0000${b}`;
 
-const USER_COLUMNS = `u.*,
-  (SELECT count(*) FROM app_sessions s WHERE s.user_id = u.id AND s.expires_at > now()) AS active_sessions,
-  ARRAY(SELECT aw.workspace_id FROM app_user_workspaces aw WHERE aw.user_id = u.id ORDER BY aw.workspace_id) AS workspace_ids,
-  COALESCE((SELECT json_agg(json_build_object('workspaceId', ua.workspace_id, 'accountId', ua.account_user_id)
-                            ORDER BY ua.workspace_id, ua.account_user_id)
-            FROM app_user_accounts ua WHERE ua.user_id = u.id), '[]'::json) AS account_grants`;
-
-/** Replaces which Slack accounts a user can see. Unknown accounts are ignored. */
-async function setAccountAccess(db: pg.Pool | pg.PoolClient, userId: number, access: z.infer<typeof accountAccess>) {
-  await db.query('UPDATE app_users SET all_accounts = $2, updated_at = now() WHERE id = $1', [userId, access.allAccounts]);
-  await db.query('DELETE FROM app_user_accounts WHERE user_id = $1', [userId]);
-  if (access.accounts.length) {
-    await db.query(
-      `INSERT INTO app_user_accounts (user_id, workspace_id, account_user_id)
-       SELECT $1, a.workspace_id, a.user_id FROM accounts a
-       JOIN unnest($2::text[], $3::text[]) AS g(ws, acct) ON g.ws = a.workspace_id AND g.acct = a.user_id
-       ON CONFLICT DO NOTHING`,
-      [userId, access.accounts.map((x) => x.workspaceId), access.accounts.map((x) => x.accountId)],
-    );
-  }
+async function userView(u: Document) {
+  const sessions = await col.appSessions.countDocuments({ user_id: u.id, expires_at: { $gt: new Date() } });
+  return {
+    id: Number(u.id),
+    email: u.email,
+    name: u.name ?? null,
+    role: u.role,
+    isActive: u.is_active !== false,
+    lastLoginAt: u.last_login_at ?? null,
+    createdAt: u.created_at,
+    activeSessions: sessions,
+    allWorkspaces: u.all_workspaces !== false,
+    workspaceIds: [...(u.workspace_ids ?? [])].sort(),
+    allAccounts: u.all_accounts !== false,
+    accounts: [...(u.account_grants ?? [])].sort((a, b) => byText(a.workspaceId, b.workspaceId) || byText(a.accountId, b.accountId)),
+  };
 }
 
-/** Replaces a user's community access. Unknown workspace ids are ignored. */
-async function setWorkspaceAccess(db: pg.Pool | pg.PoolClient, userId: number, access: z.infer<typeof workspaceAccess>) {
-  await db.query('UPDATE app_users SET all_workspaces = $2, updated_at = now() WHERE id = $1', [userId, access.allWorkspaces]);
-  await db.query('DELETE FROM app_user_workspaces WHERE user_id = $1', [userId]);
-  if (access.workspaceIds.length) {
-    await db.query(
-      `INSERT INTO app_user_workspaces (user_id, workspace_id) SELECT $1, w.id FROM workspaces w WHERE w.id = ANY($2::text[])`,
-      [userId, access.workspaceIds],
-    );
-  }
+/** Which Slack accounts a user can see. Unknown accounts are ignored. */
+async function accountAccessUpdate(access: z.infer<typeof accountAccess>) {
+  const wanted = access.accounts;
+  const known = wanted.length ? await col.accounts.find({ $or: wanted.map((x) => ({ workspace_id: x.workspaceId, user_id: x.accountId })) }).toArray() : [];
+  const grants = [...new Map(known.map((a) => [k2(a.workspace_id, a.user_id), { workspaceId: a.workspace_id as string, accountId: a.user_id as string }])).values()];
+  return { all_accounts: access.allAccounts, account_grants: grants };
+}
+
+/** A user's community access. Unknown workspace ids are ignored. */
+async function workspaceAccessUpdate(access: z.infer<typeof workspaceAccess>) {
+  const ids = access.workspaceIds.length ? await col.workspaces.distinct('id', { id: { $in: access.workspaceIds } }) : [];
+  return { all_workspaces: access.allWorkspaces, workspace_ids: ids };
 }
 
 /** Keeps at least one active admin: true if changing `userId` as described would leave none. */
 async function wouldRemoveLastAdmin(userId: number, next: { role?: string; isActive?: boolean; deleted?: boolean }) {
-  const { rows } = await pool.query(
-    `SELECT count(*) FILTER (WHERE role = 'admin' AND is_active AND id <> $1) AS others,
-            bool_or(id = $1 AND role = 'admin' AND is_active) AS is_admin
-     FROM app_users`,
-    [userId],
-  );
+  const [self, others] = await Promise.all([
+    col.appUsers.findOne({ id: userId, role: 'admin', is_active: true }),
+    col.appUsers.countDocuments({ id: { $ne: userId }, role: 'admin', is_active: true }),
+  ]);
   const losesAdmin = next.deleted || next.isActive === false || (next.role !== undefined && next.role !== 'admin');
-  return Boolean(rows[0].is_admin) && losesAdmin && rows[0].others === 0;
+  return Boolean(self) && Boolean(losesAdmin) && others === 0;
 }
 
 const csvCell = (v: unknown) => {
@@ -153,61 +140,66 @@ export async function adminRoutes(app: FastifyInstance) {
   // Status
   // ---------------------------------------------------------------------------
   app.get('/overview', async () => {
-    const [totals, runs, hourly, failures, size] = await Promise.all([
-      pool.query(`
-        SELECT (SELECT count(*) FROM messages) AS messages,
-               (SELECT count(*) FROM messages WHERE thread_ts IS NOT NULL AND thread_ts <> ts) AS thread_replies,
-               (SELECT count(*) FROM messages WHERE captured_at > now() - interval '24 hours') AS messages_24h,
-               (SELECT max(captured_at) FROM messages) AS last_ingest_at,
-               (SELECT count(*) FROM channels) AS channels,
-               (SELECT count(*) FROM channels WHERE is_hidden) AS hidden_channels,
-               (SELECT count(*) FROM channels WHERE capture_excluded) AS excluded_channels,
-               (SELECT count(*) FROM workspaces) AS workspaces,
-               (SELECT count(*) FROM slack_users) AS people,
-               (SELECT count(*) FROM accounts) AS accounts,
-               (SELECT count(*) FROM collectors) AS collectors,
-               (SELECT count(*) FROM collectors WHERE last_seen_at > now() - ${ONLINE_WINDOW} AND status <> 'revoked') AS collectors_online,
-               (SELECT count(*) FROM collectors WHERE status = 'paused') AS collectors_paused,
-               (SELECT count(*) FROM app_users) AS app_users,
-               (SELECT count(*) FROM deleted_messages) AS deleted_messages,
-               (SELECT count(*) FROM collector_commands WHERE status IN ('pending', 'delivered')) AS commands_open`),
-      pool.query(`SELECT status, count(*) AS n FROM sync_runs WHERE started_at > now() - interval '24 hours' GROUP BY 1`),
-      pool.query(`
-        SELECT to_char(h, 'YYYY-MM-DD"T"HH24:00:00"Z"') AS hour, COALESCE(x.n, 0) AS messages
-        FROM generate_series(date_trunc('hour', now() AT TIME ZONE 'UTC') - interval '47 hours',
-                             date_trunc('hour', now() AT TIME ZONE 'UTC'), interval '1 hour') h
-        LEFT JOIN (SELECT date_trunc('hour', captured_at AT TIME ZONE 'UTC') AS hr, count(*) AS n
-                   FROM messages WHERE captured_at > now() - interval '48 hours' GROUP BY 1) x ON x.hr = h
-        ORDER BY h`),
-      pool.query(`
-        SELECT r.id, r.workspace_id, r.channel_id, c.name AS channel_name, r.error, r.started_at,
-               k.label AS collector_label, k.browser
-        FROM sync_runs r
-        LEFT JOIN channels c ON c.workspace_id = r.workspace_id AND c.id = r.channel_id
-        LEFT JOIN collectors k ON k.id = r.collector_id
-        WHERE r.status = 'failed' ORDER BY r.started_at DESC LIMIT 8`),
-      pool.query('SELECT pg_database_size(current_database()) AS bytes'),
+    const now = Date.now();
+    const day = new Date(now - DAY_MS);
+    const hourMs = 3600_000;
+    const currentHour = Math.floor(now / hourMs) * hourMs;
+    const n = (c: keyof typeof col, f: Document = {}) => col[c].countDocuments(f);
+    const [
+      messages, threadReplies, messages24h, last, channels, hiddenChannels, excludedChannels, workspaces, people, accounts,
+      collectors, collectorsOnline, collectorsPaused, appUsers, deletedMessages, commandsOpen, runs, hourly, failures, stats,
+    ] = await Promise.all([
+      col.messages.estimatedDocumentCount(),
+      n('messages', { thread_ts: { $type: 'string' }, $expr: { $ne: ['$thread_ts', '$ts'] } }),
+      n('messages', { captured_at: { $gt: day } }),
+      col.messages.find({}, { projection: { captured_at: 1 } }).sort({ captured_at: -1 }).limit(1).next(),
+      n('channels'),
+      n('channels', { is_hidden: true }),
+      n('channels', { capture_excluded: true }),
+      n('workspaces'),
+      n('slackUsers'),
+      n('accounts'),
+      n('collectors'),
+      n('collectors', { last_seen_at: { $gt: new Date(now - ONLINE_MS) }, status: { $ne: 'revoked' } }),
+      n('collectors', { status: 'paused' }),
+      n('appUsers'),
+      n('deletedMessages'),
+      n('collectorCommands', { status: { $in: ['pending', 'delivered'] } }),
+      col.syncRuns.aggregate([{ $match: { started_at: { $gt: day } } }, { $group: { _id: '$status', n: { $sum: 1 } } }]).toArray(),
+      col.messages
+        .aggregate([
+          { $match: { captured_at: { $gt: new Date(currentHour - 47 * hourMs) } } },
+          { $group: { _id: { $dateTrunc: { date: '$captured_at', unit: 'hour' } }, n: { $sum: 1 } } },
+        ])
+        .toArray(),
+      col.syncRuns.find({ status: 'failed' }).sort({ started_at: -1 }).limit(8).toArray(),
+      db.command({ dbStats: 1 }),
     ]);
-    const t = totals.rows[0];
-    const runCounts = Object.fromEntries(runs.rows.map((r) => [r.status, r.n]));
+    const [chans, ks] = await Promise.all([
+      lookupMap('channels', failures.filter((r) => r.channel_id).map((r) => ({ ws: r.workspace_id, id: r.channel_id }))),
+      col.collectors.find({ id: { $in: failures.map((r) => r.collector_id).filter(Boolean) } }).toArray(),
+    ]);
+    const kBy = new Map(ks.map((x) => [x.id, x]));
+    const runCounts = Object.fromEntries(runs.map((r) => [r._id, r.n]));
+    const hourBy = new Map(hourly.map((h) => [(h._id as Date).getTime(), h.n]));
     return {
       totals: {
-        messages: t.messages,
-        threadReplies: t.thread_replies,
-        messages24h: t.messages_24h,
-        lastIngestAt: t.last_ingest_at,
-        channels: t.channels,
-        hiddenChannels: t.hidden_channels,
-        excludedChannels: t.excluded_channels,
-        workspaces: t.workspaces,
-        people: t.people,
-        accounts: t.accounts,
-        collectors: t.collectors,
-        collectorsOnline: t.collectors_online,
-        collectorsPaused: t.collectors_paused,
-        appUsers: t.app_users,
-        deletedMessages: t.deleted_messages,
-        commandsOpen: t.commands_open,
+        messages,
+        threadReplies,
+        messages24h,
+        lastIngestAt: last?.captured_at ?? null,
+        channels,
+        hiddenChannels,
+        excludedChannels,
+        workspaces,
+        people,
+        accounts,
+        collectors,
+        collectorsOnline,
+        collectorsPaused,
+        appUsers,
+        deletedMessages,
+        commandsOpen,
       },
       runs24h: {
         completed: runCounts.completed ?? 0,
@@ -215,17 +207,24 @@ export async function adminRoutes(app: FastifyInstance) {
         running: runCounts.running ?? 0,
         cancelled: runCounts.cancelled ?? 0,
       },
-      hourly: hourly.rows,
-      recentFailures: failures.rows.map((r) => ({
-        id: r.id,
-        workspaceId: r.workspace_id,
-        channelId: r.channel_id,
-        channelName: r.channel_name,
-        error: r.error,
-        startedAt: r.started_at,
-        collector: r.collector_label || r.browser,
-      })),
-      databaseBytes: Number(size.rows[0].bytes),
+      hourly: Array.from({ length: 48 }, (_, i) => {
+        const t = currentHour - (47 - i) * hourMs;
+        return { hour: new Date(t).toISOString().replace('.000Z', 'Z'), messages: hourBy.get(t) ?? 0 };
+      }),
+      recentFailures: failures.map((r) => {
+        const k = r.collector_id ? kBy.get(r.collector_id) : undefined;
+        return {
+          id: r.id,
+          workspaceId: r.workspace_id,
+          channelId: r.channel_id ?? null,
+          channelName: r.channel_id ? (chans.get(k2(r.workspace_id, r.channel_id))?.name ?? null) : null,
+          error: r.error ?? null,
+          startedAt: r.started_at,
+          collector: k?.label || k?.browser || null,
+        };
+      }),
+      // Stored size on disk (data + indexes). Atlas M0 allows 512 MB.
+      databaseBytes: Number(stats.storageSize ?? 0) + Number(stats.indexSize ?? 0),
     };
   });
 
@@ -234,37 +233,44 @@ export async function adminRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   app.get('/files', async () => {
     const [byStatus, blobs, byKind, failures] = await Promise.all([
-      pool.query(`SELECT status, count(*) AS n FROM message_files GROUP BY 1`),
-      pool.query(`SELECT count(*) AS n, COALESCE(sum(size_bytes), 0) AS bytes FROM file_blobs`),
-      pool.query(`
-        SELECT COALESCE(f.kind, 'other') AS kind, count(DISTINCT b.sha256) AS files, COALESCE(sum(DISTINCT b.size_bytes), 0) AS bytes
-        FROM file_blobs b JOIN message_files f ON f.blob_sha256 = b.sha256 GROUP BY 1 ORDER BY 3 DESC`),
-      pool.query(`
-        SELECT f.id, f.name, f.kind, f.status, f.attempts, f.last_error, m.workspace_id, m.channel_id, c.name AS channel_name, m.ts, m.sent_at
-        FROM message_files f
-        JOIN messages m ON m.id = f.message_id
-        JOIN channels c ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
-        WHERE f.status = 'failed' ORDER BY f.id DESC LIMIT 20`),
+      col.messageFiles.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]).toArray(),
+      col.fileBlobs.aggregate([{ $group: { _id: null, n: { $sum: 1 }, bytes: { $sum: '$size_bytes' } } }]).toArray(),
+      col.messageFiles
+        .aggregate([
+          { $match: { blob_sha256: { $type: 'string' } } },
+          { $group: { _id: { kind: { $ifNull: ['$kind', 'other'] }, sha: '$blob_sha256' } } },
+          { $lookup: { from: 'file_blobs', localField: '_id.sha', foreignField: 'sha256', as: 'b' } },
+          { $unwind: '$b' },
+          { $group: { _id: '$_id.kind', files: { $sum: 1 }, bytes: { $sum: '$b.size_bytes' } } },
+          { $sort: { bytes: -1 } },
+        ])
+        .toArray(),
+      col.messageFiles.find({ status: 'failed' }).sort({ id: -1 }).limit(20).toArray(),
     ]);
-    const counts = Object.fromEntries(byStatus.rows.map((r) => [r.status, r.n]));
+    const [chans, msgs] = await Promise.all([
+      lookupMap('channels', failures.map((f) => ({ ws: f.workspace_id, id: f.channel_id }))),
+      col.messages.find({ id: { $in: failures.map((f) => f.message_id) } }, { projection: { id: 1, ts: 1, sent_at: 1 } }).toArray(),
+    ]);
+    const msgBy = new Map(msgs.map((m) => [m.id, m]));
+    const counts = Object.fromEntries(byStatus.map((r) => [r._id, r.n]));
     return {
       storage: fileStore.name,
       maxBytes: config.files.maxBytes,
       counts: { stored: counts.stored ?? 0, pending: counts.pending ?? 0, failed: counts.failed ?? 0, skipped: counts.skipped ?? 0 },
-      blobs: blobs.rows[0].n,
-      bytes: Number(blobs.rows[0].bytes),
-      byKind: byKind.rows.map((r) => ({ kind: r.kind, files: r.files, bytes: Number(r.bytes) })),
-      recentFailures: failures.rows.map((r) => ({
-        id: Number(r.id),
-        name: r.name,
-        kind: r.kind,
-        attempts: r.attempts,
-        error: r.last_error,
-        workspaceId: r.workspace_id,
-        channelId: r.channel_id,
-        channelName: r.channel_name,
-        ts: r.ts,
-        sentAt: r.sent_at,
+      blobs: blobs[0]?.n ?? 0,
+      bytes: blobs[0]?.bytes ?? 0,
+      byKind: byKind.map((r) => ({ kind: r._id, files: r.files, bytes: r.bytes })),
+      recentFailures: failures.map((f) => ({
+        id: f.id,
+        name: f.name ?? null,
+        kind: f.kind ?? null,
+        attempts: f.attempts ?? 0,
+        error: f.last_error ?? null,
+        workspaceId: f.workspace_id,
+        channelId: f.channel_id,
+        channelName: chans.get(k2(f.workspace_id, f.channel_id))?.name ?? null,
+        ts: msgBy.get(f.message_id)?.ts ?? null,
+        sentAt: msgBy.get(f.message_id)?.sent_at ?? f.sent_at ?? null,
       })),
     };
   });
@@ -272,105 +278,107 @@ export async function adminRoutes(app: FastifyInstance) {
   /** Puts failed (or skipped) files back in the download queue, e.g. after raising the size limit. */
   app.post('/files/retry', async (req) => {
     const body = fileRetryBody.parse(req.body);
-    const { rowCount } = await pool.query(
-      `UPDATE message_files SET status = 'pending', attempts = 0, next_attempt_at = NULL, leased_by = NULL, lease_until = NULL
-       WHERE status = $1 AND (download_url IS NOT NULL OR thumb_url IS NOT NULL)`,
-      [body.status],
+    const res = await col.messageFiles.updateMany(
+      { status: body.status, $or: [{ download_url: { $type: 'string' } }, { thumb_url: { $type: 'string' } }] },
+      { $set: { status: 'pending', attempts: 0, next_attempt_at: null, leased_by: null, lease_until: null } },
     );
-    await audit(req, 'files.retry', body.status, { files: rowCount });
-    return { ok: true, queued: rowCount ?? 0 };
+    await audit(req, 'files.retry', body.status, { files: res.modifiedCount });
+    return { ok: true, queued: res.modifiedCount };
   });
 
   // ---------------------------------------------------------------------------
   // Dashboard users
   // ---------------------------------------------------------------------------
   app.get('/users', async () => {
-    const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM app_users u ORDER BY u.role, lower(u.email)`);
-    return rows.map(toUser);
+    const users = await col.appUsers.find({}).toArray();
+    users.sort((a, b) => byText(a.role, b.role) || byText(lower(a.email), lower(b.email)));
+    return Promise.all(users.map(userView));
   });
 
   app.post('/users', async (req, reply) => {
     const body = userCreate.parse(req.body);
     const access = workspaceAccess.optional().parse((req.body as { access?: unknown })?.access);
     const acctAccess = accountAccess.optional().parse((req.body as { accountAccess?: unknown })?.accountAccess);
-    const hash = await hashPassword(body.password);
-    const id = await withTransaction(async (db) => {
-      const { rows } = await db.query(
-        `INSERT INTO app_users (email, name, role, password_hash) VALUES ($1, $2, $3, $4)
-         ON CONFLICT DO NOTHING RETURNING id`,
-        [body.email, body.name || null, body.role, hash],
-      );
-      if (!rows[0]) return null;
-      if (access) await setWorkspaceAccess(db, Number(rows[0].id), access);
-      if (acctAccess) await setAccountAccess(db, Number(rows[0].id), acctAccess);
-      await audit(req, 'user.create', String(rows[0].id), { email: body.email, role: body.role, ...access, ...acctAccess }, db);
-      return Number(rows[0].id);
-    });
-    if (id === null) return reply.code(409).send({ error: 'a user with that email already exists' });
-    const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM app_users u WHERE u.id = $1`, [id]);
-    return toUser(rows[0]);
+    if (await col.appUsers.findOne({ email: body.email })) return reply.code(409).send({ error: 'a user with that email already exists' });
+    const now = new Date();
+    const doc: Document = {
+      id: await nextId('app_users'),
+      email: body.email,
+      name: body.name || null,
+      role: body.role,
+      password_hash: await hashPassword(body.password),
+      is_active: true,
+      last_login_at: null,
+      all_workspaces: true,
+      workspace_ids: [],
+      all_accounts: true,
+      account_grants: [],
+      created_at: now,
+      updated_at: now,
+      ...(access ? await workspaceAccessUpdate(access) : {}),
+      ...(acctAccess ? await accountAccessUpdate(acctAccess) : {}),
+    };
+    try {
+      await col.appUsers.insertOne(doc);
+    } catch (err) {
+      if (isDuplicateKey(err)) return reply.code(409).send({ error: 'a user with that email already exists' });
+      throw err;
+    }
+    await audit(req, 'user.create', String(doc.id), { email: body.email, role: body.role, ...access, ...acctAccess });
+    return userView(doc);
   });
 
   /** Which Slack accounts a user can see (and "view as"). Takes effect on the user's next request. */
   app.put<{ Params: { id: string } }>('/users/:id/accounts', async (req, reply) => {
     const id = Number(req.params.id);
     const access = accountAccess.parse(req.body);
-    const found = await withTransaction(async (db) => {
-      const { rowCount } = await db.query('SELECT 1 FROM app_users WHERE id = $1 FOR UPDATE', [id]);
-      if (!rowCount) return false;
-      await setAccountAccess(db, id, access);
-      await audit(req, 'user.accounts', String(id), { allAccounts: access.allAccounts, accounts: access.accounts.map((x) => `${x.workspaceId}/${x.accountId}`) }, db);
-      return true;
-    });
-    if (!found) return reply.code(404).send({ error: 'user not found' });
-    const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM app_users u WHERE u.id = $1`, [id]);
-    return toUser(rows[0]);
+    const u = await col.appUsers.findOneAndUpdate({ id }, { $set: { ...(await accountAccessUpdate(access)), updated_at: new Date() } }, { returnDocument: 'after' });
+    if (!u) return reply.code(404).send({ error: 'user not found' });
+    await audit(req, 'user.accounts', String(id), { allAccounts: access.allAccounts, accounts: access.accounts.map((x) => `${x.workspaceId}/${x.accountId}`) });
+    return userView(u);
   });
 
   /** Which communities (workspaces) a user can see. Takes effect on the user's next request; no re-login needed. */
   app.put<{ Params: { id: string } }>('/users/:id/workspaces', async (req, reply) => {
     const id = Number(req.params.id);
     const access = workspaceAccess.parse(req.body);
-    const found = await withTransaction(async (db) => {
-      const { rowCount } = await db.query('SELECT 1 FROM app_users WHERE id = $1 FOR UPDATE', [id]);
-      if (!rowCount) return false;
-      await setWorkspaceAccess(db, id, access);
-      await audit(req, 'user.workspaces', String(id), access, db);
-      return true;
-    });
-    if (!found) return reply.code(404).send({ error: 'user not found' });
-    const { rows } = await pool.query(`SELECT ${USER_COLUMNS} FROM app_users u WHERE u.id = $1`, [id]);
-    return toUser(rows[0]);
+    const u = await col.appUsers.findOneAndUpdate({ id }, { $set: { ...(await workspaceAccessUpdate(access)), updated_at: new Date() } }, { returnDocument: 'after' });
+    if (!u) return reply.code(404).send({ error: 'user not found' });
+    await audit(req, 'user.workspaces', String(id), access);
+    return userView(u);
   });
 
   app.patch<{ Params: { id: string } }>('/users/:id', async (req, reply) => {
     const id = Number(req.params.id);
     const body = userPatch.parse(req.body);
     if (await wouldRemoveLastAdmin(id, body)) return reply.code(400).send({ error: 'there must be at least one active admin' });
-    const { rows } = await pool.query(
-      `UPDATE app_users SET
-         name          = CASE WHEN $2::boolean THEN $3 ELSE name END,
-         role          = COALESCE($4::app_role, role),
-         is_active     = COALESCE($5, is_active),
-         password_hash = COALESCE($6, password_hash),
-         updated_at    = now()
-       WHERE id = $1 RETURNING *`,
-      [id, body.name !== undefined, body.name ?? null, body.role ?? null, body.isActive ?? null, body.password ? await hashPassword(body.password) : null],
-    );
-    if (!rows[0]) return reply.code(404).send({ error: 'user not found' });
+    const set: Document = { updated_at: new Date() };
+    if (body.name !== undefined) set.name = body.name ?? null;
+    if (body.role) set.role = body.role;
+    if (body.isActive !== undefined) set.is_active = body.isActive;
+    if (body.password) set.password_hash = await hashPassword(body.password);
+    const u = await col.appUsers.findOneAndUpdate({ id }, { $set: set }, { returnDocument: 'after' });
+    if (!u) return reply.code(404).send({ error: 'user not found' });
     // Deactivation, role change and password reset all end the user's existing sessions.
-    if (body.isActive === false || body.password || body.role) await pool.query('DELETE FROM app_sessions WHERE user_id = $1', [id]);
+    if (body.isActive === false || body.password || body.role) await col.appSessions.deleteMany({ user_id: id });
     await audit(req, 'user.update', String(id), { ...body, password: body.password ? '(reset)' : undefined });
-    return toUser(rows[0]);
+    return userView(u);
   });
 
   app.delete<{ Params: { id: string } }>('/users/:id', async (req, reply) => {
     const id = Number(req.params.id);
     if (id === req.user!.id) return reply.code(400).send({ error: "you can't delete your own account" });
     if (await wouldRemoveLastAdmin(id, { deleted: true })) return reply.code(400).send({ error: 'there must be at least one active admin' });
-    const { rows } = await pool.query('DELETE FROM app_users WHERE id = $1 RETURNING email', [id]);
-    if (!rows[0]) return reply.code(404).send({ error: 'user not found' });
-    await audit(req, 'user.delete', String(id), { email: rows[0].email });
+    const u = await col.appUsers.findOneAndDelete({ id });
+    if (!u) return reply.code(404).send({ error: 'user not found' });
+    await Promise.all([
+      col.appSessions.deleteMany({ user_id: id }),
+      col.channelReads.deleteMany({ app_user_id: id }),
+      col.auditLog.updateMany({ user_id: id }, { $set: { user_id: null } }),
+      col.collectorCommands.updateMany({ created_by: id }, { $set: { created_by: null } }),
+      col.deletedMessages.updateMany({ deleted_by: id }, { $set: { deleted_by: null } }),
+    ]);
+    await audit(req, 'user.delete', String(id), { email: u.email });
     return { ok: true };
   });
 
@@ -378,114 +386,150 @@ export async function adminRoutes(app: FastifyInstance) {
   // Collectors (extension installs) + remote commands
   // ---------------------------------------------------------------------------
   app.get('/collectors', async () => {
-    const { rows } = await pool.query(`
-      SELECT k.*, w.name AS workspace_name, COALESCE(a.display_name, su.display_name) AS account_name,
-             COALESCE(a.avatar_url, su.avatar_url) AS account_avatar,
-             k.last_seen_at > now() - ${ONLINE_WINDOW} AS online,
-             (SELECT count(*) FROM sync_runs r WHERE r.collector_id = k.id) AS run_count,
-             (SELECT count(*) FROM sync_runs r WHERE r.collector_id = k.id AND r.status = 'failed'
-                AND r.started_at > now() - interval '24 hours') AS failed_24h,
-             (SELECT COALESCE(sum(r.messages_received), 0) FROM sync_runs r WHERE r.collector_id = k.id) AS messages_received,
-             (SELECT max(r.started_at) FROM sync_runs r WHERE r.collector_id = k.id) AS last_run_at,
-             (SELECT count(*) FROM collector_commands cc WHERE cc.collector_id = k.id AND cc.status IN ('pending', 'delivered')) AS open_commands
-      FROM collectors k
-      LEFT JOIN workspaces w ON w.id = k.workspace_id
-      LEFT JOIN accounts a ON a.workspace_id = k.workspace_id AND a.user_id = k.account_user_id
-      LEFT JOIN slack_users su ON su.workspace_id = k.workspace_id AND su.id = k.account_user_id
-      ORDER BY (k.status = 'revoked'), k.last_seen_at DESC`);
-    return rows.map((r) => ({
-      id: r.id,
-      label: r.label,
-      browser: r.browser,
-      version: r.extension_version,
-      status: r.status,
-      notes: r.notes,
-      workspaceId: r.workspace_id,
-      workspaceName: r.workspace_name,
-      accountId: r.account_user_id,
-      accountName: r.account_name,
-      accountAvatar: r.account_avatar,
-      online: r.online && r.status !== 'revoked',
-      firstSeenAt: r.first_seen_at,
-      lastSeenAt: r.last_seen_at,
-      lastRunAt: r.last_run_at,
-      runCount: r.run_count,
-      failed24h: r.failed_24h,
-      messagesReceived: Number(r.messages_received),
-      openCommands: r.open_commands,
-    }));
+    const collectors = await col.collectors.find({}).toArray();
+    const ids = collectors.map((k) => k.id);
+    const pairs = collectors.filter((k) => k.workspace_id && k.account_user_id).map((k) => ({ ws: k.workspace_id, id: k.account_user_id }));
+    const day = new Date(Date.now() - DAY_MS);
+    const [workspaces, accounts, users, runs, cmds] = await Promise.all([
+      col.workspaces.find({ id: { $in: [...new Set(collectors.map((k) => k.workspace_id))] } }).toArray(),
+      pairs.length ? col.accounts.find({ $or: pairs.map((p) => ({ workspace_id: p.ws, user_id: p.id })) }).toArray() : [],
+      lookupMap('slackUsers', pairs),
+      col.syncRuns
+        .aggregate([
+          { $match: { collector_id: { $in: ids } } },
+          {
+            $group: {
+              _id: '$collector_id',
+              n: { $sum: 1 },
+              failed24h: { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'failed'] }, { $gt: ['$started_at', day] }] }, 1, 0] } },
+              received: { $sum: '$messages_received' },
+              lastRun: { $max: '$started_at' },
+            },
+          },
+        ])
+        .toArray(),
+      col.collectorCommands
+        .aggregate([{ $match: { collector_id: { $in: ids }, status: { $in: ['pending', 'delivered'] } } }, { $group: { _id: '$collector_id', n: { $sum: 1 } } }])
+        .toArray(),
+    ]);
+    const wsName = new Map(workspaces.map((w) => [w.id, w.name ?? null]));
+    const acc = new Map(accounts.map((a) => [k2(a.workspace_id, a.user_id), a]));
+    const runBy = new Map(runs.map((r) => [r._id, r]));
+    const cmdBy = new Map(cmds.map((c) => [c._id, c.n]));
+    collectors.sort(
+      (a, b) => Number(a.status === 'revoked') - Number(b.status === 'revoked') || (b.last_seen_at?.getTime() ?? 0) - (a.last_seen_at?.getTime() ?? 0),
+    );
+    return collectors.map((k) => {
+      const a = acc.get(k2(k.workspace_id, k.account_user_id));
+      const su = users.get(k2(k.workspace_id, k.account_user_id));
+      const r = runBy.get(k.id);
+      return {
+        id: k.id,
+        label: k.label ?? null,
+        browser: k.browser ?? null,
+        version: k.extension_version ?? null,
+        status: k.status ?? 'active',
+        notes: k.notes ?? null,
+        workspaceId: k.workspace_id ?? null,
+        workspaceName: wsName.get(k.workspace_id) ?? null,
+        accountId: k.account_user_id ?? null,
+        accountName: a?.display_name ?? su?.display_name ?? null,
+        accountAvatar: a?.avatar_url ?? su?.avatar_url ?? null,
+        online: isOnline(k.last_seen_at) && k.status !== 'revoked',
+        firstSeenAt: k.first_seen_at,
+        lastSeenAt: k.last_seen_at,
+        lastRunAt: r?.lastRun ?? null,
+        runCount: r?.n ?? 0,
+        failed24h: r?.failed24h ?? 0,
+        messagesReceived: r?.received ?? 0,
+        openCommands: cmdBy.get(k.id) ?? 0,
+      };
+    });
   });
 
   app.patch<{ Params: { id: string } }>('/collectors/:id', async (req, reply) => {
     const body = collectorPatch.parse(req.body);
-    const { rows } = await pool.query(
-      `UPDATE collectors SET
-         label  = CASE WHEN $2::boolean THEN $3 ELSE label END,
-         notes  = CASE WHEN $4::boolean THEN $5 ELSE notes END,
-         status = COALESCE($6, status)
-       WHERE id = $1 RETURNING id`,
-      [req.params.id, body.label !== undefined, body.label || null, body.notes !== undefined, body.notes || null, body.status ?? null],
-    );
-    if (!rows[0]) return reply.code(404).send({ error: 'collector not found' });
+    const set: Document = {};
+    if (body.label !== undefined) set.label = body.label || null;
+    if (body.notes !== undefined) set.notes = body.notes || null;
+    if (body.status) set.status = body.status;
+    const found = Object.keys(set).length
+      ? (await col.collectors.updateOne({ id: req.params.id }, { $set: set })).matchedCount > 0
+      : Boolean(await col.collectors.findOne({ id: req.params.id }, { projection: { _id: 1 } }));
+    if (!found) return reply.code(404).send({ error: 'collector not found' });
     if (body.status === 'revoked') {
-      await pool.query(`UPDATE collector_commands SET status = 'cancelled' WHERE collector_id = $1 AND status = 'pending'`, [req.params.id]);
+      await col.collectorCommands.updateMany({ collector_id: req.params.id, status: 'pending' }, { $set: { status: 'cancelled' } });
     }
     await audit(req, body.status ? `collector.${body.status === 'active' ? 'resume' : body.status === 'paused' ? 'pause' : 'revoke'}` : 'collector.update', req.params.id, body);
     return { ok: true };
   });
 
   app.delete<{ Params: { id: string } }>('/collectors/:id', async (req, reply) => {
-    const { rowCount } = await pool.query('DELETE FROM collectors WHERE id = $1', [req.params.id]);
-    if (!rowCount) return reply.code(404).send({ error: 'collector not found' });
+    const res = await col.collectors.deleteOne({ id: req.params.id });
+    if (!res.deletedCount) return reply.code(404).send({ error: 'collector not found' });
+    await col.collectorCommands.deleteMany({ collector_id: req.params.id });
     await audit(req, 'collector.delete', req.params.id);
     return { ok: true };
   });
 
   app.post<{ Params: { id: string } }>('/collectors/:id/commands', async (req, reply) => {
     const cmd = commandCreate.parse(req.body);
-    const { rows: c } = await pool.query('SELECT status FROM collectors WHERE id = $1', [req.params.id]);
-    if (!c[0]) return reply.code(404).send({ error: 'collector not found' });
-    if (c[0].status === 'revoked') return reply.code(400).send({ error: 'collector is revoked' });
-    const { rows } = await pool.query(
-      `INSERT INTO collector_commands (collector_id, type, payload, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
-      [req.params.id, cmd.type, cmd.payload, req.user!.id],
-    );
+    const k = await col.collectors.findOne({ id: req.params.id }, { projection: { status: 1 } });
+    if (!k) return reply.code(404).send({ error: 'collector not found' });
+    if (k.status === 'revoked') return reply.code(400).send({ error: 'collector is revoked' });
+    const id = await nextId('collector_commands');
+    await col.collectorCommands.insertOne({
+      id,
+      collector_id: req.params.id,
+      type: cmd.type,
+      payload: cmd.payload,
+      status: 'pending',
+      result: null,
+      created_by: req.user!.id,
+      created_at: new Date(),
+      delivered_at: null,
+      finished_at: null,
+    });
     await audit(req, `command.${cmd.type}`, req.params.id, cmd.payload);
-    return { ok: true, id: Number(rows[0].id) };
+    return { ok: true, id };
   });
 
   app.get<{ Querystring: { collectorId?: string; limit?: string } }>('/commands', async (req) => {
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 500);
-    const { rows } = await pool.query(
-      `SELECT cc.*, k.label AS collector_label, k.browser, u.email AS created_by_email
-       FROM collector_commands cc
-       JOIN collectors k ON k.id = cc.collector_id
-       LEFT JOIN app_users u ON u.id = cc.created_by
-       WHERE ($1::uuid IS NULL OR cc.collector_id = $1)
-       ORDER BY cc.created_at DESC LIMIT $2`,
-      [req.query.collectorId || null, limit],
-    );
-    return rows.map((r) => ({
-      id: Number(r.id),
-      collectorId: r.collector_id,
-      collector: r.collector_label || r.browser,
-      type: r.type,
-      payload: r.payload,
-      status: r.status,
-      result: r.result,
-      createdBy: r.created_by_email,
-      createdAt: r.created_at,
-      deliveredAt: r.delivered_at,
-      finishedAt: r.finished_at,
-    }));
+    const cmds = await col.collectorCommands
+      .find(req.query.collectorId ? { collector_id: req.query.collectorId } : {})
+      .sort({ created_at: -1, id: -1 })
+      .limit(limit)
+      .toArray();
+    const [ks, us] = await Promise.all([
+      col.collectors.find({ id: { $in: [...new Set(cmds.map((c) => c.collector_id))] } }).toArray(),
+      col.appUsers.find({ id: { $in: [...new Set(cmds.map((c) => c.created_by).filter((x) => x != null))] } }, { projection: { id: 1, email: 1 } }).toArray(),
+    ]);
+    const kBy = new Map(ks.map((x) => [x.id, x]));
+    const uBy = new Map(us.map((x) => [x.id, x.email]));
+    return cmds
+      .filter((c) => kBy.has(c.collector_id))
+      .map((c) => {
+        const k = kBy.get(c.collector_id)!;
+        return {
+          id: c.id,
+          collectorId: c.collector_id,
+          collector: k.label || k.browser || null,
+          type: c.type,
+          payload: c.payload,
+          status: c.status,
+          result: c.result ?? null,
+          createdBy: c.created_by != null ? (uBy.get(c.created_by) ?? null) : null,
+          createdAt: c.created_at,
+          deliveredAt: c.delivered_at ?? null,
+          finishedAt: c.finished_at ?? null,
+        };
+      });
   });
 
   app.post<{ Params: { id: string } }>('/commands/:id/cancel', async (req, reply) => {
-    const { rowCount } = await pool.query(
-      `UPDATE collector_commands SET status = 'cancelled', finished_at = now() WHERE id = $1 AND status = 'pending'`,
-      [req.params.id],
-    );
-    if (!rowCount) return reply.code(400).send({ error: 'only pending commands can be cancelled' });
+    const res = await col.collectorCommands.updateOne({ id: Number(req.params.id), status: 'pending' }, { $set: { status: 'cancelled', finished_at: new Date() } });
+    if (!res.matchedCount) return reply.code(400).send({ error: 'only pending commands can be cancelled' });
     await audit(req, 'command.cancel', req.params.id);
     return { ok: true };
   });
@@ -494,97 +538,99 @@ export async function adminRoutes(app: FastifyInstance) {
   // Content
   // ---------------------------------------------------------------------------
   app.get('/workspaces', async () => {
-    const { rows } = await pool.query(`
-      SELECT w.*, (SELECT count(*) FROM messages m WHERE m.workspace_id = w.id) AS message_count,
-             (SELECT count(*) FROM channels c WHERE c.workspace_id = w.id) AS channel_count,
-             (SELECT min(sent_at) FROM messages m WHERE m.workspace_id = w.id) AS oldest_message_at
-      FROM workspaces w ORDER BY w.name NULLS LAST`);
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      domain: r.domain,
-      iconUrl: r.icon_url,
-      retentionDays: r.retention_days,
-      messageCount: r.message_count,
-      channelCount: r.channel_count,
-      oldestMessageAt: r.oldest_message_at,
-      createdAt: r.created_at,
+    const [workspaces, msgStats, chStats] = await Promise.all([
+      col.workspaces.find({}).toArray(),
+      col.messages.aggregate([{ $group: { _id: '$workspace_id', n: { $sum: 1 }, oldest: { $min: '$sent_at' } } }]).toArray(),
+      col.channels.aggregate([{ $group: { _id: '$workspace_id', n: { $sum: 1 } } }]).toArray(),
+    ]);
+    const msg = new Map(msgStats.map((s) => [s._id, s]));
+    const ch = new Map(chStats.map((s) => [s._id, s.n]));
+    workspaces.sort((a, b) => Number(a.name == null) - Number(b.name == null) || byText(a.name ?? '', b.name ?? ''));
+    return workspaces.map((w) => ({
+      id: w.id,
+      name: w.name ?? null,
+      domain: w.domain ?? null,
+      iconUrl: w.icon_url ?? null,
+      retentionDays: w.retention_days ?? null,
+      messageCount: msg.get(w.id)?.n ?? 0,
+      channelCount: ch.get(w.id) ?? 0,
+      oldestMessageAt: msg.get(w.id)?.oldest ?? null,
+      createdAt: w.created_at,
     }));
   });
 
   app.patch<{ Params: { id: string } }>('/workspaces/:id', async (req, reply) => {
     const body = workspacePatch.parse(req.body);
-    const result = await withTransaction(async (db) => {
-      const { rows } = await db.query(
-        `UPDATE workspaces SET
-           name = COALESCE($2, name),
-           retention_days = CASE WHEN $3::boolean THEN $4 ELSE retention_days END,
-           updated_at = now()
-         WHERE id = $1 RETURNING retention_days`,
-        [req.params.id, body.name ?? null, body.retentionDays !== undefined, body.retentionDays ?? null],
-      );
-      if (!rows[0]) return null;
-      let purged = 0;
-      if (rows[0].retention_days) {
-        const del = await db.query(
-          `DELETE FROM messages WHERE workspace_id = $1 AND sent_at < now() - make_interval(days => $2)`,
-          [req.params.id, rows[0].retention_days],
-        );
-        purged = del.rowCount ?? 0;
-      }
-      await audit(req, 'workspace.update', req.params.id, { ...body, purged }, db);
-      return { purged };
-    });
-    if (!result) return reply.code(404).send({ error: 'workspace not found' });
-    return { ok: true, ...result };
+    const set: Document = { updated_at: new Date() };
+    if (body.name) set.name = body.name;
+    if (body.retentionDays !== undefined) set.retention_days = body.retentionDays;
+    const w = await col.workspaces.findOneAndUpdate({ id: req.params.id }, { $set: set }, { returnDocument: 'after' });
+    if (!w) return reply.code(404).send({ error: 'workspace not found' });
+    let purged = 0;
+    if (w.retention_days) {
+      purged = await deleteMessages({ workspace_id: req.params.id, sent_at: { $lt: new Date(Date.now() - w.retention_days * DAY_MS) } });
+    }
+    await audit(req, 'workspace.update', req.params.id, { ...body, purged });
+    return { ok: true, purged };
   });
 
   app.delete<{ Params: { id: string } }>('/workspaces/:id', async (req, reply) => {
-    const { rowCount } = await pool.query('DELETE FROM workspaces WHERE id = $1', [req.params.id]);
-    if (!rowCount) return reply.code(404).send({ error: 'workspace not found' });
-    await pool.query('UPDATE collectors SET workspace_id = NULL, account_user_id = NULL WHERE workspace_id = $1', [req.params.id]);
-    await audit(req, 'workspace.delete', req.params.id);
+    const ws = req.params.id;
+    const res = await col.workspaces.deleteOne({ id: ws });
+    if (!res.deletedCount) return reply.code(404).send({ error: 'workspace not found' });
+    const f = { workspace_id: ws };
+    await Promise.all([
+      col.channels.deleteMany(f),
+      col.messages.deleteMany(f),
+      col.messageFiles.deleteMany(f),
+      col.slackUsers.deleteMany(f),
+      col.accounts.deleteMany(f),
+      col.channelAccounts.deleteMany(f),
+      col.channelReads.deleteMany(f),
+      col.syncRuns.deleteMany(f),
+      col.appUsers.updateMany({}, { $pull: { workspace_ids: ws, account_grants: { workspaceId: ws } } as Document }),
+      col.collectors.updateMany(f, { $set: { workspace_id: null, account_user_id: null } }),
+    ]);
+    await audit(req, 'workspace.delete', ws);
     return { ok: true };
   });
 
   /** Captured Slack accounts (of one community, or all of them), with their visibility to viewers. */
   app.get<{ Querystring: { workspaceId?: string } }>('/accounts', async (req) => {
-    const workspaceId = req.query.workspaceId || null;
-    const { rows } = await pool.query(
-      `SELECT a.workspace_id, a.user_id, COALESCE(a.display_name, su.display_name) AS name, COALESCE(a.avatar_url, su.avatar_url) AS avatar_url,
-              a.is_hidden, a.first_seen_at, a.last_seen_at,
-              (SELECT count(*) FROM channel_accounts ca WHERE ca.workspace_id = a.workspace_id AND ca.account_user_id = a.user_id) AS channel_count,
-              (SELECT max(ca.last_synced_at) FROM channel_accounts ca WHERE ca.workspace_id = a.workspace_id AND ca.account_user_id = a.user_id) AS last_synced_at,
-              EXISTS (SELECT 1 FROM collectors k WHERE k.workspace_id = a.workspace_id AND k.account_user_id = a.user_id
-                        AND k.last_seen_at > now() - ${ONLINE_WINDOW}) AS online
-       FROM accounts a
-       LEFT JOIN slack_users su ON su.workspace_id = a.workspace_id AND su.id = a.user_id
-       WHERE ($1::text IS NULL OR a.workspace_id = $1)
-       ORDER BY a.workspace_id, lower(COALESCE(a.display_name, su.display_name, a.user_id))`,
-      [workspaceId],
-    );
-    return rows.map((r) => ({
-      workspaceId: r.workspace_id,
-      id: r.user_id,
-      name: r.name,
-      avatarUrl: r.avatar_url,
-      isHidden: r.is_hidden,
-      online: r.online,
-      channelCount: r.channel_count,
-      firstSeenAt: r.first_seen_at,
-      lastSeenAt: r.last_seen_at,
-      lastSyncedAt: r.last_synced_at,
-    }));
+    const filter = req.query.workspaceId ? { workspace_id: req.query.workspaceId } : {};
+    const accounts = await col.accounts.find(filter).toArray();
+    const [users, links, online] = await Promise.all([
+      lookupMap('slackUsers', accounts.map((a) => ({ ws: a.workspace_id, id: a.user_id }))),
+      col.channelAccounts
+        .aggregate([{ $match: filter }, { $group: { _id: { ws: '$workspace_id', a: '$account_user_id' }, n: { $sum: 1 }, last: { $max: '$last_synced_at' } } }])
+        .toArray(),
+      col.collectors.find({ ...filter, last_seen_at: { $gt: new Date(Date.now() - ONLINE_MS) } }, { projection: { workspace_id: 1, account_user_id: 1 } }).toArray(),
+    ]);
+    const linkBy = new Map(links.map((l) => [k2(l._id.ws, l._id.a), l]));
+    const onlineSet = new Set(online.map((k) => k2(k.workspace_id, k.account_user_id)));
+    const rows = accounts.map((a) => {
+      const key = k2(a.workspace_id, a.user_id);
+      const su = users.get(key);
+      return {
+        workspaceId: a.workspace_id,
+        id: a.user_id,
+        name: a.display_name ?? su?.display_name ?? null,
+        avatarUrl: a.avatar_url ?? su?.avatar_url ?? null,
+        isHidden: Boolean(a.is_hidden),
+        online: onlineSet.has(key),
+        channelCount: linkBy.get(key)?.n ?? 0,
+        firstSeenAt: a.first_seen_at,
+        lastSeenAt: a.last_seen_at,
+        lastSyncedAt: linkBy.get(key)?.last ?? null,
+      };
+    });
+    return rows.sort((a, b) => byText(a.workspaceId, b.workspaceId) || byText(lower(a.name ?? a.id), lower(b.name ?? b.id)));
   });
 
   app.patch<{ Params: { ws: string; id: string } }>('/accounts/:ws/:id', async (req, reply) => {
     const body = accountPatch.parse(req.body);
-    const { rowCount } = await pool.query('UPDATE accounts SET is_hidden = $3 WHERE workspace_id = $1 AND user_id = $2', [
-      req.params.ws,
-      req.params.id,
-      body.isHidden,
-    ]);
-    if (!rowCount) return reply.code(404).send({ error: 'account not found' });
+    const res = await col.accounts.updateOne({ workspace_id: req.params.ws, user_id: req.params.id }, { $set: { is_hidden: body.isHidden } });
+    if (!res.matchedCount) return reply.code(404).send({ error: 'account not found' });
     await audit(req, body.isHidden ? 'account.hide' : 'account.show', `${req.params.ws}/${req.params.id}`);
     return { ok: true };
   });
@@ -595,48 +641,63 @@ export async function adminRoutes(app: FastifyInstance) {
     // Paged when `limit` is given (infinite scroll); otherwise the full list.
     const limit = req.query.limit ? Math.min(Number(req.query.limit) || 100, 500) : null;
     const offset = Math.max(Number(req.query.offset) || 0, 0);
-    const { rows } = await pool.query(
-      `SELECT c.id, c.name, c.type, c.is_hidden, c.capture_excluded, c.reached_start, c.last_synced_at,
-              COALESCE(s.n, 0) AS message_count, COALESCE(s.replies, 0) AS reply_count, s.first_at, s.last_at,
-              (SELECT count(*) FROM channel_accounts ca WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id) AS account_count
-       FROM channels c
-       LEFT JOIN (
-         SELECT channel_id, count(*) AS n, count(*) FILTER (WHERE thread_ts IS NOT NULL AND thread_ts <> ts) AS replies,
-                min(sent_at) AS first_at, max(sent_at) AS last_at
-         FROM messages WHERE workspace_id = $1 GROUP BY channel_id
-       ) s ON s.channel_id = c.id
-       WHERE c.workspace_id = $1
-         AND ($2::text IS NULL OR c.name ILIKE '%' || $2 || '%' OR c.id = $2)
-         AND ($3::text IS NULL OR ($3 = 'hidden' AND c.is_hidden) OR ($3 = 'excluded' AND c.capture_excluded)
-              OR ($3 = 'empty' AND s.n IS NULL) OR ($3 = 'incomplete' AND NOT c.reached_start AND s.n IS NOT NULL))
-       ORDER BY message_count DESC, lower(c.name), c.id
-       LIMIT $4 OFFSET $5`,
-      [workspaceId, q?.trim() || null, filter || null, limit, offset],
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      type: r.type,
-      isHidden: r.is_hidden,
-      captureExcluded: r.capture_excluded,
-      reachedStart: r.reached_start,
-      lastSyncedAt: r.last_synced_at,
-      messageCount: r.message_count,
-      replyCount: r.reply_count,
-      firstMessageAt: r.first_at,
-      lastMessageAt: r.last_at,
-      accountCount: r.account_count,
-    }));
+    const [channels, stats, links] = await Promise.all([
+      col.channels.find({ workspace_id: workspaceId }).toArray(),
+      col.messages
+        .aggregate([
+          { $match: { workspace_id: workspaceId } },
+          {
+            $group: {
+              _id: '$channel_id',
+              n: { $sum: 1 },
+              replies: { $sum: { $cond: [{ $and: [{ $eq: [{ $type: '$thread_ts' }, 'string'] }, { $ne: ['$thread_ts', '$ts'] }] }, 1, 0] } },
+              first: { $min: '$sent_at' },
+              last: { $max: '$sent_at' },
+            },
+          },
+        ])
+        .toArray(),
+      col.channelAccounts.aggregate([{ $match: { workspace_id: workspaceId } }, { $group: { _id: '$channel_id', n: { $sum: 1 } } }]).toArray(),
+    ]);
+    const s = new Map(stats.map((x) => [x._id, x]));
+    const l = new Map(links.map((x) => [x._id, x.n]));
+    const needle = q?.trim().toLowerCase() || null;
+    const rows = channels
+      .filter((c) => !needle || lower(c.name).includes(needle) || c.id === q?.trim())
+      .filter((c) => {
+        const n = s.get(c.id)?.n;
+        if (!filter) return true;
+        if (filter === 'hidden') return c.is_hidden;
+        if (filter === 'excluded') return c.capture_excluded;
+        if (filter === 'empty') return !n;
+        if (filter === 'incomplete') return !c.reached_start && Boolean(n);
+        return false;
+      })
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        type: c.type,
+        isHidden: Boolean(c.is_hidden),
+        captureExcluded: Boolean(c.capture_excluded),
+        reachedStart: Boolean(c.reached_start),
+        lastSyncedAt: c.last_synced_at ?? null,
+        messageCount: s.get(c.id)?.n ?? 0,
+        replyCount: s.get(c.id)?.replies ?? 0,
+        firstMessageAt: s.get(c.id)?.first ?? null,
+        lastMessageAt: s.get(c.id)?.last ?? null,
+        accountCount: l.get(c.id) ?? 0,
+      }))
+      .sort((a, b) => b.messageCount - a.messageCount || byText(lower(a.name), lower(b.name)) || byText(a.id, b.id));
+    return limit === null ? rows.slice(offset) : rows.slice(offset, offset + limit);
   });
 
   app.patch<{ Params: { ws: string; ch: string } }>('/channels/:ws/:ch', async (req, reply) => {
     const body = channelPatch.parse(req.body);
-    const { rowCount } = await pool.query(
-      `UPDATE channels SET is_hidden = COALESCE($3, is_hidden), capture_excluded = COALESCE($4, capture_excluded), updated_at = now()
-       WHERE workspace_id = $1 AND id = $2`,
-      [req.params.ws, req.params.ch, body.isHidden ?? null, body.captureExcluded ?? null],
-    );
-    if (!rowCount) return reply.code(404).send({ error: 'channel not found' });
+    const set: Document = { updated_at: new Date() };
+    if (body.isHidden !== undefined) set.is_hidden = body.isHidden;
+    if (body.captureExcluded !== undefined) set.capture_excluded = body.captureExcluded;
+    const res = await col.channels.updateOne({ workspace_id: req.params.ws, id: req.params.ch }, { $set: set });
+    if (!res.matchedCount) return reply.code(404).send({ error: 'channel not found' });
     await audit(req, 'channel.update', `${req.params.ws}/${req.params.ch}`, body);
     return { ok: true };
   });
@@ -646,22 +707,16 @@ export async function adminRoutes(app: FastifyInstance) {
     const ids = body.channelIds;
     let affected = 0;
     if (body.action === 'purge') {
-      const del = await pool.query('DELETE FROM messages WHERE workspace_id = $1 AND channel_id = ANY($2::text[])', [body.workspaceId, ids]);
-      await pool.query(
-        `UPDATE channels SET oldest_synced_ts = NULL, newest_synced_ts = NULL, reached_start = false
-         WHERE workspace_id = $1 AND id = ANY($2::text[])`,
-        [body.workspaceId, ids],
+      affected = await deleteMessages({ workspace_id: body.workspaceId, channel_id: { $in: ids } });
+      await col.channels.updateMany(
+        { workspace_id: body.workspaceId, id: { $in: ids } },
+        { $set: { oldest_synced_ts: null, newest_synced_ts: null, reached_start: false } },
       );
-      affected = del.rowCount ?? 0;
     } else {
-      const col = body.action === 'hide' || body.action === 'unhide' ? 'is_hidden' : 'capture_excluded';
+      const field = body.action === 'hide' || body.action === 'unhide' ? 'is_hidden' : 'capture_excluded';
       const val = body.action === 'hide' || body.action === 'exclude';
-      const upd = await pool.query(`UPDATE channels SET ${col} = $3, updated_at = now() WHERE workspace_id = $1 AND id = ANY($2::text[])`, [
-        body.workspaceId,
-        ids,
-        val,
-      ]);
-      affected = upd.rowCount ?? 0;
+      const res = await col.channels.updateMany({ workspace_id: body.workspaceId, id: { $in: ids } }, { $set: { [field]: val, updated_at: new Date() } });
+      affected = res.matchedCount;
     }
     await audit(req, `channel.bulk_${body.action}`, body.workspaceId, { channelIds: ids, affected });
     return { ok: true, affected };
@@ -670,48 +725,40 @@ export async function adminRoutes(app: FastifyInstance) {
   /** Deletes a conversation's messages (optionally only those before a date). They can be captured again later. */
   app.post<{ Params: { ws: string; ch: string } }>('/channels/:ws/:ch/purge', async (req) => {
     const body = purgeBody.parse(req.body ?? {});
-    const del = await pool.query(
-      `DELETE FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND ($3::date IS NULL OR sent_at < $3::date)`,
-      [req.params.ws, req.params.ch, body.before ?? null],
+    const deleted = await deleteMessages({
+      workspace_id: req.params.ws,
+      channel_id: req.params.ch,
+      ...(body.before ? { sent_at: { $lt: new Date(`${body.before}T00:00:00Z`) } } : {}),
+    });
+    await col.channels.updateOne(
+      { workspace_id: req.params.ws, id: req.params.ch },
+      { $set: body.before ? { reached_start: false } : { oldest_synced_ts: null, newest_synced_ts: null, reached_start: false } },
     );
-    if (!body.before) {
-      await pool.query(
-        `UPDATE channels SET oldest_synced_ts = NULL, newest_synced_ts = NULL, reached_start = false WHERE workspace_id = $1 AND id = $2`,
-        [req.params.ws, req.params.ch],
-      );
-    } else {
-      await pool.query('UPDATE channels SET reached_start = false WHERE workspace_id = $1 AND id = $2', [req.params.ws, req.params.ch]);
-    }
-    await audit(req, 'channel.purge', `${req.params.ws}/${req.params.ch}`, { before: body.before, deleted: del.rowCount });
-    return { ok: true, deleted: del.rowCount ?? 0 };
+    await audit(req, 'channel.purge', `${req.params.ws}/${req.params.ch}`, { before: body.before, deleted });
+    return { ok: true, deleted };
   });
 
   app.delete<{ Params: { ws: string; ch: string } }>('/channels/:ws/:ch', async (req, reply) => {
-    const { rowCount } = await pool.query('DELETE FROM channels WHERE workspace_id = $1 AND id = $2', [req.params.ws, req.params.ch]);
-    if (!rowCount) return reply.code(404).send({ error: 'channel not found' });
+    const res = await col.channels.deleteOne({ workspace_id: req.params.ws, id: req.params.ch });
+    if (!res.deletedCount) return reply.code(404).send({ error: 'channel not found' });
+    await deleteChannelData(req.params.ws, [req.params.ch]);
     await audit(req, 'channel.delete', `${req.params.ws}/${req.params.ch}`);
     return { ok: true };
   });
 
   /** Deletes one message and remembers it so a later sync doesn't bring it back. */
   app.delete<{ Params: { id: string } }>('/messages/:id', async (req, reply) => {
-    const out = await withTransaction(async (db) => {
-      const { rows } = await db.query(
-        `DELETE FROM messages WHERE id = $1 RETURNING workspace_id, channel_id, ts, user_name, left(text, 200) AS preview`,
-        [req.params.id],
-      );
-      if (!rows[0]) return null;
-      const m = rows[0];
-      await db.query(
-        `INSERT INTO deleted_messages (workspace_id, channel_id, ts, deleted_by) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-        [m.workspace_id, m.channel_id, m.ts, req.user!.id],
-      );
-      // Thread replies go with their parent.
-      await db.query(`DELETE FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND thread_ts = $3`, [m.workspace_id, m.channel_id, m.ts]);
-      await audit(req, 'message.delete', `${m.workspace_id}/${m.channel_id}/${m.ts}`, { user: m.user_name, preview: m.preview }, db);
-      return m;
-    });
-    if (!out) return reply.code(404).send({ error: 'message not found' });
+    const m = await col.messages.findOne({ id: Number(req.params.id) });
+    if (!m) return reply.code(404).send({ error: 'message not found' });
+    await col.deletedMessages.updateOne(
+      { workspace_id: m.workspace_id, channel_id: m.channel_id, ts: m.ts },
+      { $setOnInsert: { deleted_by: req.user!.id, deleted_at: new Date() } },
+      { upsert: true },
+    );
+    // Thread replies go with their parent.
+    const replies = await col.messages.distinct('id', { workspace_id: m.workspace_id, channel_id: m.channel_id, thread_ts: m.ts });
+    await deleteMessages({ id: { $in: [m.id, ...replies] } });
+    await audit(req, 'message.delete', `${m.workspace_id}/${m.channel_id}/${m.ts}`, { user: m.user_name ?? null, preview: String(m.text ?? '').slice(0, 200) });
     return { ok: true };
   });
 
@@ -730,32 +777,54 @@ export async function adminRoutes(app: FastifyInstance) {
     });
     const cols = ['workspace_id', 'channel_id', 'channel_name', 'channel_type', 'ts', 'sent_at', 'thread_ts', 'user_id', 'user_name', 'text', 'reply_count', 'is_edited', 'is_bot', 'reactions', 'files'];
     res.write(q.format === 'csv' ? `﻿${cols.join(',')}\n` : '[\n');
+    const filter: Document = { workspace_id: q.workspaceId };
+    if (q.channelId) filter.channel_id = q.channelId;
+    if (q.from || q.to) {
+      filter.sent_at = {
+        ...(q.from ? { $gte: new Date(`${q.from}T00:00:00Z`) } : {}),
+        ...(q.to ? { $lt: new Date(Date.parse(`${q.to}T00:00:00Z`) + DAY_MS) } : {}),
+      };
+    }
     let lastId = 0;
     let first = true;
     for (;;) {
-      const { rows } = await pool.query(
-        `SELECT m.id, m.workspace_id, m.channel_id, c.name AS channel_name, c.type AS channel_type, m.ts, m.sent_at, m.thread_ts,
-                m.user_id, COALESCE(m.user_name, su.display_name, su.real_name) AS user_name, m.text, m.reply_count, m.is_edited, m.is_bot,
-                (SELECT string_agg(r.emoji || ':' || r.count, ' ') FROM message_reactions r WHERE r.message_id = m.id) AS reactions,
-                (SELECT string_agg(f.url, ' ') FROM message_files f WHERE f.message_id = m.id) AS files
-         FROM messages m
-         JOIN channels c ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
-         LEFT JOIN slack_users su ON su.workspace_id = m.workspace_id AND su.id = m.user_id
-         WHERE m.workspace_id = $1 AND ($2::text IS NULL OR m.channel_id = $2)
-           AND ($3::date IS NULL OR m.sent_at >= $3::date) AND ($4::date IS NULL OR m.sent_at < $4::date + 1)
-           AND m.id > $5
-         ORDER BY m.id LIMIT 5000`,
-        [q.workspaceId, q.channelId || null, q.from ?? null, q.to ?? null, lastId],
-      );
-      if (!rows.length) break;
-      lastId = Number(rows.at(-1).id);
+      const page = await col.messages.find({ ...filter, id: { $gt: lastId } }).sort({ id: 1 }).limit(5000).toArray();
+      if (!page.length) break;
+      lastId = page.at(-1)!.id;
+      const [chans, users, files] = await Promise.all([
+        lookupMap('channels', page.map((m) => ({ ws: m.workspace_id, id: m.channel_id }))),
+        lookupMap('slackUsers', page.filter((m) => m.user_id).map((m) => ({ ws: m.workspace_id, id: m.user_id }))),
+        col.messageFiles.find({ message_id: { $in: page.filter((m) => m.has_files).map((m) => m.id) } }, { projection: { message_id: 1, url: 1 } }).toArray(),
+      ]);
+      const filesBy = new Map<number, string[]>();
+      for (const f of files) filesBy.set(f.message_id, [...(filesBy.get(f.message_id) ?? []), f.url]);
+      const rows = page.map((m) => {
+        const c = chans.get(k2(m.workspace_id, m.channel_id));
+        const su = m.user_id ? users.get(k2(m.workspace_id, m.user_id)) : undefined;
+        return {
+          workspace_id: m.workspace_id,
+          channel_id: m.channel_id,
+          channel_name: c?.name ?? null,
+          channel_type: c?.type ?? null,
+          ts: m.ts,
+          sent_at: m.sent_at,
+          thread_ts: m.thread_ts ?? null,
+          user_id: m.user_id ?? null,
+          user_name: m.user_name ?? su?.display_name ?? su?.real_name ?? null,
+          text: m.text ?? '',
+          reply_count: m.reply_count ?? 0,
+          is_edited: Boolean(m.is_edited),
+          is_bot: Boolean(m.is_bot),
+          reactions: (m.reactions ?? []).length ? (m.reactions as Document[]).map((r) => `${r.emoji}:${r.count}`).join(' ') : null,
+          files: filesBy.get(m.id)?.join(' ') ?? null,
+        } as Record<string, unknown>;
+      });
       const chunk =
         q.format === 'csv'
-          ? rows.map((r) => cols.map((c) => csvCell(c === 'sent_at' ? new Date(r[c]).toISOString() : r[c])).join(',')).join('\n') + '\n'
+          ? rows.map((r) => cols.map((c) => csvCell(c === 'sent_at' ? (r[c] as Date).toISOString() : r[c])).join(',')).join('\n') + '\n'
           : rows
               .map((r) => {
-                const { id: _id, ...rest } = r;
-                const s = `${first ? '' : ',\n'}${JSON.stringify(rest)}`;
+                const s = `${first ? '' : ',\n'}${JSON.stringify(r)}`;
                 first = false;
                 return s;
               })
@@ -770,18 +839,16 @@ export async function adminRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   app.get<{ Querystring: { limit?: string; action?: string; before?: string } }>('/audit', async (req) => {
     const limit = Math.min(Number(req.query.limit ?? 100) || 100, 500);
-    const { rows } = await pool.query(
-      `SELECT * FROM audit_log
-       WHERE ($1::text IS NULL OR action LIKE $1 || '%') AND ($2::bigint IS NULL OR id < $2)
-       ORDER BY id DESC LIMIT $3`,
-      [req.query.action || null, req.query.before || null, limit],
-    );
+    const filter: Document = {};
+    if (req.query.action) filter.action = { $regex: `^${req.query.action.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` };
+    if (req.query.before) filter.id = { $lt: Number(req.query.before) };
+    const rows = await col.auditLog.find(filter).sort({ id: -1 }).limit(limit).toArray();
     return rows.map((r) => ({
-      id: Number(r.id),
-      userEmail: r.user_email,
+      id: r.id,
+      userEmail: r.user_email ?? null,
       action: r.action,
-      target: r.target,
-      details: r.details,
+      target: r.target ?? null,
+      details: r.details ?? null,
       createdAt: r.created_at,
     }));
   });

@@ -1,8 +1,9 @@
-import { accountVisibleSql, requireUser, viewableAccountId, visibleSql, workspaceSql } from '../auth.js';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { Document } from 'mongodb';
 import { z } from 'zod';
-import { pool } from '../db/pool.js';
-import { MESSAGE_COLUMNS, MESSAGE_FROM, toMessage } from '../services/messageSql.js';
+import { accountVisible, and, canSeeWorkspace, requireUser, viewableAccountId, visibleChannelFilter, visibleFilter, workspaceFilter } from '../auth.js';
+import { col } from '../db/mongo.js';
+import { hydrateMessages, lookupMap, topLevelFilter } from '../services/messages.js';
 
 const tsParam = z.string().regex(/^\d{9,11}\.\d{1,6}$/);
 
@@ -14,389 +15,435 @@ const messagesQuery = z.object({
 });
 
 /** A collector counts as online if it reported within this window (the extension heartbeats every minute). */
-const ONLINE_WINDOW = `interval '3 minutes'`;
+export const ONLINE_MS = 3 * 60_000;
+export const isOnline = (lastSeen: Date | null | undefined) => Boolean(lastSeen && lastSeen.getTime() > Date.now() - ONLINE_MS);
+
+const lower = (s: string | null | undefined) => (s ?? '').toLowerCase();
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * Display name for a conversation. Slack names a DM after the *other* person, so two accounts see the
  * same DM under different names: use the selected account's view, else join every account's view
- * ("Alice, Bob" for the DM between Alice and Bob). `c` = channels, `acct` = placeholder for account id or null.
+ * ("Alice, Bob" for the DM between Alice and Bob).
  */
-const channelNameSql = (acct: string) => `
-  COALESCE(
-    (SELECT ca.channel_name FROM channel_accounts ca
-      WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ca.account_user_id = ${acct}::text),
-    CASE WHEN c.type = 'dm' THEN
-      (SELECT string_agg(DISTINCT ca.channel_name, ', ') FROM channel_accounts ca
-        WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ca.channel_name IS NOT NULL)
-    END,
-    c.name)`;
+function channelName(c: Document, links: Document[], accountId: string | null): string {
+  const own = accountId ? links.find((l) => l.account_user_id === accountId)?.channel_name : null;
+  if (own) return own;
+  if (c.type === 'dm') {
+    const names = [...new Set(links.map((l) => l.channel_name).filter(Boolean))].sort(byText);
+    if (names.length) return names.join(', ');
+  }
+  return c.name;
+}
+
+interface PersonLookup {
+  byName: Map<string, Document[]>;
+}
+
+/** Slack users of one workspace indexed by lower-cased display and real name. */
+async function peopleIndex(workspaceId: string): Promise<PersonLookup> {
+  const users = await col.slackUsers
+    .find({ workspace_id: workspaceId }, { projection: { _id: 0, id: 1, display_name: 1, real_name: 1, avatar_url: 1 } })
+    .toArray();
+  const byName = new Map<string, Document[]>();
+  for (const u of users) {
+    for (const n of new Set([lower(u.display_name), lower(u.real_name)])) if (n) byName.set(n, [...(byName.get(n) ?? []), u]);
+  }
+  return { byName };
+}
 
 /**
  * People a DM or group DM is named after, with their Slack photo when we have one.
  * The sidebar name is already "Kamil" or "Kamil, renato"; match each part to slack_users.
  */
-const channelPeersSql = (acct: string) => `
-  CASE WHEN c.type IN ('dm', 'group_dm') THEN COALESCE((
-    SELECT json_agg(json_build_object('name', p.name, 'avatarUrl', p.avatar_url) ORDER BY p.name)
-    FROM (
-      SELECT DISTINCT ON (lower(btrim(part)))
-             COALESCE(su.display_name, su.real_name, btrim(part)) AS name,
-             su.avatar_url
-      FROM unnest(string_to_array(${channelNameSql(acct)}, ',')) AS part
-      LEFT JOIN slack_users su
-        ON su.workspace_id = c.workspace_id
-       AND (lower(su.display_name) = lower(btrim(part)) OR lower(COALESCE(su.real_name, '')) = lower(btrim(part)))
-      WHERE btrim(part) <> ''
-      ORDER BY lower(btrim(part)), (su.avatar_url IS NULL), su.id
-    ) p
-  ), '[]'::json) ELSE '[]'::json END`;
+function channelPeers(c: Document, name: string, people: PersonLookup) {
+  if (c.type !== 'dm' && c.type !== 'group_dm') return [];
+  const seen = new Set<string>();
+  const out: { name: string; avatarUrl: string | null }[] = [];
+  for (const raw of name.split(',')) {
+    const part = raw.trim();
+    if (!part || seen.has(part.toLowerCase())) continue;
+    seen.add(part.toLowerCase());
+    const match = [...(people.byName.get(part.toLowerCase()) ?? [])].sort(
+      (a, b) => Number(!a.avatar_url) - Number(!b.avatar_url) || byText(a.id, b.id),
+    )[0];
+    out.push({ name: match?.display_name ?? match?.real_name ?? part, avatarUrl: match?.avatar_url ?? null });
+  }
+  return out.sort((a, b) => byText(a.name, b.name));
+}
 
-/** Messages this dashboard user has not opened yet. No read cursor means the whole history is unread. */
-const unreadCountSql = (userParam: string) => `
-  (SELECT count(*) FROM messages m
-   WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id
-     AND NOT EXISTS (
-       SELECT 1 FROM channel_reads cr
-       WHERE cr.app_user_id = ${userParam}::bigint
-         AND cr.workspace_id = c.workspace_id AND cr.channel_id = c.id
-         AND cr.last_read_ts IS NOT NULL
-         AND m.ts::numeric <= cr.last_read_ts::numeric))`;
+/** Accounts (with names) for channel_accounts links, leaving out accounts this user may not see. */
+async function accountCredits(req: FastifyRequest, links: Document[]) {
+  const pairs = links.map((l) => ({ ws: l.workspace_id, id: l.account_user_id }));
+  const [accounts, users] = await Promise.all([
+    pairs.length ? col.accounts.find({ $or: pairs.map((p) => ({ workspace_id: p.ws, user_id: p.id })) }).toArray() : [],
+    lookupMap('slackUsers', pairs),
+  ]);
+  const acc = new Map(accounts.map((a) => [`${a.workspace_id}\u0000${a.user_id}`, a]));
+  return (l: Document) => {
+    const a = acc.get(`${l.workspace_id}\u0000${l.account_user_id}`);
+    if (!a || !accountVisible(req, a as never)) return null;
+    const su = users.get(`${a.workspace_id}\u0000${a.user_id}`);
+    return { id: a.user_id as string, name: (a.display_name ?? su?.display_name ?? a.user_id) as string };
+  };
+}
 
-/** Accounts that can see a conversation, as [{ id, name }]. Accounts hidden by an admin are left out for viewers. */
-const channelAccountsSql = (req: FastifyRequest) => `
-  COALESCE((SELECT json_agg(json_build_object('id', a.user_id, 'name', COALESCE(a.display_name, su.display_name, a.user_id))
-                            ORDER BY COALESCE(a.display_name, su.display_name, a.user_id))
-            FROM channel_accounts ca
-            JOIN accounts a ON a.workspace_id = ca.workspace_id AND a.user_id = ca.account_user_id
-            LEFT JOIN slack_users su ON su.workspace_id = a.workspace_id AND su.id = a.user_id
-            WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ${accountVisibleSql(req)}), '[]'::json)`;
+function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
+  const m = new Map<string, T[]>();
+  for (const it of items) m.set(key(it), [...(m.get(key(it)) ?? []), it]);
+  return m;
+}
 
 /** Read endpoints for the frontend. */
 export async function readRoutes(app: FastifyInstance) {
   app.addHook('onRequest', requireUser);
 
   app.get('/workspaces', async (req) => {
-    const { rows } = await pool.query(`
-      SELECT w.id, w.name, w.domain, w.icon_url,
-             (SELECT count(*) FROM channels c WHERE c.workspace_id = w.id) AS channel_count,
-             (SELECT count(*) FROM messages m WHERE m.workspace_id = w.id) AS message_count,
-             (SELECT max(sent_at) FROM messages m WHERE m.workspace_id = w.id) AS last_message_at
-      FROM workspaces w WHERE ${workspaceSql(req, 'w.id')} ORDER BY w.name NULLS LAST, w.id`);
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      domain: r.domain,
-      iconUrl: r.icon_url,
-      channelCount: r.channel_count,
-      messageCount: r.message_count,
-      lastMessageAt: r.last_message_at,
+    const [workspaces, msgStats, chStats] = await Promise.all([
+      col.workspaces.find(workspaceFilter(req, 'id')).toArray(),
+      col.messages.aggregate([{ $group: { _id: '$workspace_id', n: { $sum: 1 }, last: { $max: '$sent_at' } } }]).toArray(),
+      col.channels.aggregate([{ $group: { _id: '$workspace_id', n: { $sum: 1 } } }]).toArray(),
+    ]);
+    const msg = new Map(msgStats.map((s) => [s._id, s]));
+    const ch = new Map(chStats.map((s) => [s._id, s.n]));
+    // Named workspaces first, by name; then by id.
+    workspaces.sort((a, b) => Number(a.name == null) - Number(b.name == null) || byText(a.name ?? '', b.name ?? '') || byText(a.id, b.id));
+    return workspaces.map((w) => ({
+      id: w.id,
+      name: w.name ?? null,
+      domain: w.domain ?? null,
+      iconUrl: w.icon_url ?? null,
+      channelCount: ch.get(w.id) ?? 0,
+      messageCount: msg.get(w.id)?.n ?? 0,
+      lastMessageAt: msg.get(w.id)?.last ?? null,
     }));
   });
 
   /** Slack accounts that have captured data, with the browsers (collectors) they captured from. */
   app.get<{ Querystring: { workspaceId?: string } }>('/accounts', async (req) => {
-    const { rows } = await pool.query(
-      `SELECT a.workspace_id, w.name AS workspace_name, a.user_id,
-              COALESCE(a.display_name, su.display_name) AS name,
-              COALESCE(a.avatar_url, su.avatar_url) AS avatar_url,
-              a.first_seen_at, a.last_seen_at, a.is_hidden,
-              (SELECT count(*) FROM channel_accounts ca
-                WHERE ca.workspace_id = a.workspace_id AND ca.account_user_id = a.user_id) AS channel_count,
-              (SELECT count(*) FROM channel_accounts ca
-                WHERE ca.workspace_id = a.workspace_id AND ca.account_user_id = a.user_id AND ca.messages_captured > 0) AS captured_channel_count,
-              (SELECT count(*) FROM messages m
-                WHERE m.workspace_id = a.workspace_id AND m.captured_by = a.user_id) AS messages_first_captured,
-              (SELECT max(ca.last_synced_at) FROM channel_accounts ca
-                WHERE ca.workspace_id = a.workspace_id AND ca.account_user_id = a.user_id) AS last_synced_at,
-              COALESCE((SELECT json_agg(json_build_object(
-                          'id', k.id, 'label', k.label, 'browser', k.browser, 'version', k.extension_version,
-                          'lastSeenAt', k.last_seen_at, 'online', k.last_seen_at > now() - ${ONLINE_WINDOW})
-                        ORDER BY k.last_seen_at DESC)
-                        FROM collectors k WHERE k.workspace_id = a.workspace_id AND k.account_user_id = a.user_id), '[]'::json) AS collectors
-       FROM accounts a
-       JOIN workspaces w ON w.id = a.workspace_id
-       LEFT JOIN slack_users su ON su.workspace_id = a.workspace_id AND su.id = a.user_id
-       WHERE ($1::text IS NULL OR a.workspace_id = $1) AND ${workspaceSql(req, 'a.workspace_id')} AND ${accountVisibleSql(req)}
-       ORDER BY lower(COALESCE(a.display_name, su.display_name, a.user_id))`,
-      [req.query.workspaceId || null],
-    );
-    return rows.map((r) => ({
-      workspaceId: r.workspace_id,
-      workspaceName: r.workspace_name,
-      id: r.user_id,
-      name: r.name,
-      avatarUrl: r.avatar_url,
-      isHidden: r.is_hidden,
-      firstSeenAt: r.first_seen_at,
-      lastSeenAt: r.last_seen_at,
-      lastSyncedAt: r.last_synced_at,
-      channelCount: r.channel_count,
-      capturedChannelCount: r.captured_channel_count,
-      messagesFirstCaptured: r.messages_first_captured,
-      collectors: r.collectors,
-      online: (r.collectors as { online: boolean }[]).some((k) => k.online),
-    }));
+    const wsFilter = and(req.query.workspaceId ? { workspace_id: req.query.workspaceId } : {}, workspaceFilter(req));
+    const accounts = (await col.accounts.find(wsFilter).toArray()).filter((a) => accountVisible(req, a as never));
+    if (!accounts.length) return [];
+    const wsIds = [...new Set(accounts.map((a) => a.workspace_id as string))];
+    const [workspaces, users, links, firstCaptured, collectors] = await Promise.all([
+      col.workspaces.find({ id: { $in: wsIds } }).toArray(),
+      lookupMap('slackUsers', accounts.map((a) => ({ ws: a.workspace_id, id: a.user_id }))),
+      col.channelAccounts
+        .aggregate([
+          { $match: { workspace_id: { $in: wsIds } } },
+          {
+            $group: {
+              _id: { ws: '$workspace_id', a: '$account_user_id' },
+              channels: { $sum: 1 },
+              captured: { $sum: { $cond: [{ $gt: ['$messages_captured', 0] }, 1, 0] } },
+              lastSynced: { $max: '$last_synced_at' },
+            },
+          },
+        ])
+        .toArray(),
+      col.messages
+        .aggregate([
+          { $match: { workspace_id: { $in: wsIds }, captured_by: { $in: accounts.map((a) => a.user_id) } } },
+          { $group: { _id: { ws: '$workspace_id', a: '$captured_by' }, n: { $sum: 1 } } },
+        ])
+        .toArray(),
+      col.collectors.find({ workspace_id: { $in: wsIds } }).sort({ last_seen_at: -1 }).toArray(),
+    ]);
+    const k = (ws: string, a: string) => `${ws}\u0000${a}`;
+    const wsName = new Map(workspaces.map((w) => [w.id, w.name ?? null]));
+    const linkStats = new Map(links.map((l) => [k(l._id.ws, l._id.a), l]));
+    const firstBy = new Map(firstCaptured.map((f) => [k(f._id.ws, f._id.a), f.n]));
+    const collectorsBy = groupBy(collectors, (c) => k(c.workspace_id, c.account_user_id));
+
+    const rows = accounts.map((a) => {
+      const su = users.get(k(a.workspace_id, a.user_id));
+      const ls = linkStats.get(k(a.workspace_id, a.user_id));
+      const ks = (collectorsBy.get(k(a.workspace_id, a.user_id)) ?? []).map((c) => ({
+        id: c.id,
+        label: c.label ?? null,
+        browser: c.browser ?? null,
+        version: c.extension_version ?? null,
+        lastSeenAt: c.last_seen_at,
+        online: isOnline(c.last_seen_at),
+      }));
+      return {
+        workspaceId: a.workspace_id,
+        workspaceName: wsName.get(a.workspace_id) ?? null,
+        id: a.user_id,
+        name: a.display_name ?? su?.display_name ?? null,
+        avatarUrl: a.avatar_url ?? su?.avatar_url ?? null,
+        isHidden: Boolean(a.is_hidden),
+        firstSeenAt: a.first_seen_at,
+        lastSeenAt: a.last_seen_at,
+        lastSyncedAt: ls?.lastSynced ?? null,
+        channelCount: ls?.channels ?? 0,
+        capturedChannelCount: ls?.captured ?? 0,
+        messagesFirstCaptured: firstBy.get(k(a.workspace_id, a.user_id)) ?? 0,
+        collectors: ks,
+        online: ks.some((c) => c.online),
+      };
+    });
+    return rows.sort((x, y) => byText(lower(x.name ?? x.id), lower(y.name ?? y.id)));
   });
 
   app.get<{ Querystring: { workspaceId?: string; accountId?: string } }>('/channels', async (req, reply) => {
     const { workspaceId } = req.query;
     if (!workspaceId) return reply.code(400).send({ error: 'workspaceId is required' });
     const accountId = await viewableAccountId(req, req.query.accountId);
+    let channels = await col.channels.find(and({ workspace_id: workspaceId }, visibleChannelFilter(req))).toArray();
+    const links = await col.channelAccounts.find({ workspace_id: workspaceId }).toArray();
+    const linksBy = groupBy(links, (l) => l.channel_id);
     // With accountId: only conversations that account has in its sidebar or has captured.
-    const { rows } = await pool.query(
-      `SELECT c.id, ${channelNameSql('$2')} AS name, c.type, c.topic, c.is_archived, c.is_hidden, c.reached_start, c.last_synced_at,
-              COALESCE(s.message_count, 0) AS message_count, s.first_message_at, s.last_message_at,
-              ${unreadCountSql('$3')} AS unread_count,
-              ${channelPeersSql('$2')} AS peers,
-              ${channelAccountsSql(req)} AS accounts
-       FROM channels c
-       LEFT JOIN (
-         SELECT channel_id, count(*) AS message_count, min(sent_at) AS first_message_at, max(sent_at) AS last_message_at
-         FROM messages WHERE workspace_id = $1 GROUP BY channel_id
-       ) s ON s.channel_id = c.id
-       WHERE c.workspace_id = $1 AND ${visibleSql(req, 'c.workspace_id', 'c.id')}
-         AND ($2::text IS NULL OR EXISTS (
-               SELECT 1 FROM channel_accounts ca
-               WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ca.account_user_id = $2))
-       ORDER BY lower(c.name)`,
-      [workspaceId, accountId, req.user!.id],
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      type: r.type,
-      topic: r.topic,
-      isArchived: r.is_archived,
-      isHidden: r.is_hidden,
-      reachedStart: r.reached_start,
-      lastSyncedAt: r.last_synced_at,
-      messageCount: r.message_count,
-      unreadCount: Number(r.unread_count),
-      peers: r.peers ?? [],
-      firstMessageAt: r.first_message_at,
-      lastMessageAt: r.last_message_at,
-      accounts: r.accounts,
-    }));
+    if (accountId) channels = channels.filter((c) => (linksBy.get(c.id) ?? []).some((l) => l.account_user_id === accountId));
+
+    const reads = await col.channelReads.find({ app_user_id: req.user!.id, workspace_id: workspaceId, last_read_ts: { $ne: null } }).toArray();
+    const cursor = {
+      $ifNull: [{ $let: { vars: { hit: { $first: { $filter: { input: { $literal: reads.map((r) => ({ c: r.channel_id, ts: r.last_read_ts })) }, cond: { $eq: ['$$this.c', '$channel_id'] } } } } }, in: '$$hit.ts' } }, ''],
+    };
+    const [stats, people, credit] = await Promise.all([
+      col.messages
+        .aggregate([
+          { $match: { workspace_id: workspaceId } },
+          {
+            $group: {
+              _id: '$channel_id',
+              n: { $sum: 1 },
+              first: { $min: '$sent_at' },
+              last: { $max: '$sent_at' },
+              // No read cursor means the whole history is unread.
+              unread: { $sum: { $cond: [{ $gt: ['$ts', cursor] }, 1, 0] } },
+            },
+          },
+        ])
+        .toArray(),
+      peopleIndex(workspaceId),
+      accountCredits(req, links),
+    ]);
+    const statsBy = new Map(stats.map((s) => [s._id, s]));
+
+    const rows = channels.map((c) => {
+      const cl = linksBy.get(c.id) ?? [];
+      const name = channelName(c, cl, accountId);
+      const s = statsBy.get(c.id);
+      return {
+        id: c.id,
+        name,
+        type: c.type,
+        topic: c.topic ?? null,
+        isArchived: Boolean(c.is_archived),
+        isHidden: Boolean(c.is_hidden),
+        reachedStart: Boolean(c.reached_start),
+        lastSyncedAt: c.last_synced_at ?? null,
+        messageCount: s?.n ?? 0,
+        unreadCount: s?.unread ?? 0,
+        peers: channelPeers(c, name, people),
+        firstMessageAt: s?.first ?? null,
+        lastMessageAt: s?.last ?? null,
+        accounts: cl.map(credit).filter((x) => x !== null).sort((a, b) => byText(a.name, b.name)),
+        _sort: lower(c.name),
+      };
+    });
+    return rows.sort((a, b) => byText(a._sort, b._sort)).map(({ _sort, ...r }) => r);
   });
 
   app.get<{ Params: { workspaceId: string; channelId: string }; Querystring: { accountId?: string } }>(
     '/channels/:workspaceId/:channelId',
     async (req, reply) => {
       const { workspaceId, channelId } = req.params;
-      const { rows } = await pool.query(
-        `SELECT c.id, ${channelNameSql('$3')} AS name, c.type, ${channelAccountsSql(req)} AS accounts,
-                ${channelPeersSql('$3')} AS peers, c.topic, c.reached_start, c.last_synced_at,
-                (SELECT count(*) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS message_count,
-                (SELECT count(DISTINCT user_id) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS member_count,
-                (SELECT min(sent_at) FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.id) AS first_message_at
-         FROM channels c WHERE c.workspace_id = $1 AND c.id = $2 AND ${visibleSql(req, 'c.workspace_id', 'c.id')}`,
-        [workspaceId, channelId, await viewableAccountId(req, req.query.accountId)],
-      );
-      if (!rows[0]) return reply.code(404).send({ error: 'channel not found' });
-      const r = rows[0];
+      const c = await col.channels.findOne(and({ workspace_id: workspaceId, id: channelId }, visibleChannelFilter(req)));
+      if (!c) return reply.code(404).send({ error: 'channel not found' });
+      const accountId = await viewableAccountId(req, req.query.accountId);
+      const f = { workspace_id: workspaceId, channel_id: channelId };
+      const [links, stats, members, people] = await Promise.all([
+        col.channelAccounts.find(f).toArray(),
+        col.messages.aggregate([{ $match: f }, { $group: { _id: null, n: { $sum: 1 }, first: { $min: '$sent_at' } } }]).toArray(),
+        col.messages.distinct('user_id', f),
+        peopleIndex(workspaceId),
+      ]);
+      const credit = await accountCredits(req, links);
+      const name = channelName(c, links, accountId);
       return {
-        id: r.id,
-        name: r.name,
-        type: r.type,
-        topic: r.topic,
-        reachedStart: r.reached_start,
-        lastSyncedAt: r.last_synced_at,
-        messageCount: r.message_count,
-        memberCount: r.member_count,
-        firstMessageAt: r.first_message_at,
-        peers: r.peers ?? [],
-        accounts: r.accounts,
+        id: c.id,
+        name,
+        type: c.type,
+        topic: c.topic ?? null,
+        reachedStart: Boolean(c.reached_start),
+        lastSyncedAt: c.last_synced_at ?? null,
+        messageCount: stats[0]?.n ?? 0,
+        memberCount: members.filter((u) => u != null).length,
+        firstMessageAt: stats[0]?.first ?? null,
+        peers: channelPeers(c, name, people),
+        accounts: links.map(credit).filter((x) => x !== null).sort((a, b) => byText(a.name, b.name)),
       };
     },
   );
 
   /** Remember that this dashboard user has seen messages through `ts` (or the newest message we hold). */
-  app.post<{ Params: { workspaceId: string; channelId: string } }>(
-    '/channels/:workspaceId/:channelId/read',
-    async (req, reply) => {
-      const { workspaceId, channelId } = req.params;
-      const { ts } = z.object({ ts: tsParam.optional() }).parse(req.body ?? {});
-      const visible = await pool.query(
-        `SELECT 1 FROM channels c WHERE c.workspace_id = $1 AND c.id = $2 AND ${visibleSql(req, 'c.workspace_id', 'c.id')}`,
-        [workspaceId, channelId],
-      );
-      if (!visible.rows[0]) return reply.code(404).send({ error: 'channel not found' });
+  app.post<{ Params: { workspaceId: string; channelId: string } }>('/channels/:workspaceId/:channelId/read', async (req, reply) => {
+    const { workspaceId, channelId } = req.params;
+    const { ts } = z.object({ ts: tsParam.optional() }).parse(req.body ?? {});
+    const visible = await col.channels.findOne(and({ workspace_id: workspaceId, id: channelId }, visibleChannelFilter(req)), { projection: { _id: 1 } });
+    if (!visible) return reply.code(404).send({ error: 'channel not found' });
 
-      const cursor = ts ?? (
-        await pool.query<{ ts: string | null }>(
-          'SELECT max(ts) AS ts FROM messages WHERE workspace_id = $1 AND channel_id = $2',
-          [workspaceId, channelId],
-        )
-      ).rows[0]?.ts;
-      if (!cursor) return { ok: true };
+    const cursor =
+      ts ??
+      (await col.messages.find({ workspace_id: workspaceId, channel_id: channelId }, { projection: { ts: 1 } }).sort({ ts: -1 }).limit(1).next())?.ts;
+    if (!cursor) return { ok: true };
 
-      await pool.query(
-        `INSERT INTO channel_reads (app_user_id, workspace_id, channel_id, last_read_ts)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (app_user_id, workspace_id, channel_id) DO UPDATE
-           SET last_read_ts = CASE
-                 WHEN channel_reads.last_read_ts IS NULL OR EXCLUDED.last_read_ts::numeric > channel_reads.last_read_ts::numeric
-                 THEN EXCLUDED.last_read_ts ELSE channel_reads.last_read_ts END,
-               updated_at = now()`,
-        [req.user!.id, workspaceId, channelId, cursor],
-      );
-      return { ok: true };
-    },
-  );
+    // The cursor only moves forward.
+    await col.channelReads.updateOne(
+      { app_user_id: req.user!.id, workspace_id: workspaceId, channel_id: channelId },
+      [{ $set: { last_read_ts: { $max: ['$last_read_ts', { $literal: cursor }] }, updated_at: '$$NOW' } }],
+      { upsert: true },
+    );
+    return { ok: true };
+  });
 
   /**
    * Paged message history for one channel, always returned oldest → newest.
    * - no cursor: the latest `limit` messages
    * - before=ts: older page; after=ts: newer page; around=ts: a window centred on that message
    */
-  app.get<{ Params: { workspaceId: string; channelId: string } }>(
-    '/channels/:workspaceId/:channelId/messages',
-    async (req) => {
-      const { workspaceId, channelId } = req.params;
-      const q = messagesQuery.parse(req.query);
-      // Thread replies live in the thread panel; only top-level messages (and replies also sent to the channel) go here.
-      const base = `SELECT ${MESSAGE_COLUMNS} ${MESSAGE_FROM} WHERE m.workspace_id = $1 AND m.channel_id = $2
-        AND ${visibleSql(req, 'm.workspace_id', 'm.channel_id')}
-        AND (m.thread_ts IS NULL OR m.thread_ts = m.ts OR m.subtype = 'thread_broadcast')`;
+  app.get<{ Params: { workspaceId: string; channelId: string } }>('/channels/:workspaceId/:channelId/messages', async (req) => {
+    const { workspaceId, channelId } = req.params;
+    const q = messagesQuery.parse(req.query);
+    const base = and({ workspace_id: workspaceId, channel_id: channelId }, await visibleFilter(req), topLevelFilter);
 
-      const older = async (cursor: string | null, n: number, inclusive = false) => {
-        const cond = cursor ? ` AND m.ts ${inclusive ? '<=' : '<'} $3` : '';
-        const params = cursor ? [workspaceId, channelId, cursor, n + 1] : [workspaceId, channelId, n + 1];
-        const { rows } = await pool.query(`${base}${cond} ORDER BY m.ts DESC LIMIT $${params.length}`, params);
-        return { rows: rows.slice(0, n).reverse(), more: rows.length > n };
-      };
-      const newer = async (cursor: string, n: number) => {
-        const { rows } = await pool.query(`${base} AND m.ts > $3 ORDER BY m.ts ASC LIMIT $4`, [
-          workspaceId,
-          channelId,
-          cursor,
-          n + 1,
-        ]);
-        return { rows: rows.slice(0, n), more: rows.length > n };
-      };
+    const older = async (cursor: string | null, n: number, inclusive = false) => {
+      const f = cursor ? and(base, { ts: { [inclusive ? '$lte' : '$lt']: cursor } }) : base;
+      const rows = await col.messages.find(f).sort({ ts: -1 }).limit(n + 1).toArray();
+      return { rows: rows.slice(0, n).reverse(), more: rows.length > n };
+    };
+    const newer = async (cursor: string, n: number) => {
+      const rows = await col.messages.find(and(base, { ts: { $gt: cursor } })).sort({ ts: 1 }).limit(n + 1).toArray();
+      return { rows: rows.slice(0, n), more: rows.length > n };
+    };
 
-      if (q.around) {
-        const half = Math.ceil(q.limit / 2);
-        const [a, b] = await Promise.all([older(q.around, half, true), newer(q.around, half)]);
-        return { messages: [...a.rows, ...b.rows].map(toMessage), hasOlder: a.more, hasNewer: b.more };
-      }
-      if (q.after) {
-        const b = await newer(q.after, q.limit);
-        return { messages: b.rows.map(toMessage), hasOlder: true, hasNewer: b.more };
-      }
-      const a = await older(q.before ?? null, q.limit);
-      return { messages: a.rows.map(toMessage), hasOlder: a.more, hasNewer: Boolean(q.before) };
-    },
-  );
+    if (q.around) {
+      const half = Math.ceil(q.limit / 2);
+      const [a, b] = await Promise.all([older(q.around, half, true), newer(q.around, half)]);
+      return { messages: await hydrateMessages([...a.rows, ...b.rows]), hasOlder: a.more, hasNewer: b.more };
+    }
+    if (q.after) {
+      const b = await newer(q.after, q.limit);
+      return { messages: await hydrateMessages(b.rows), hasOlder: true, hasNewer: b.more };
+    }
+    const a = await older(q.before ?? null, q.limit);
+    return { messages: await hydrateMessages(a.rows), hasOlder: a.more, hasNewer: Boolean(q.before) };
+  });
 
-  /** Replies we hold for a thread (populated once thread capture lands; see requirements.md #12). */
-  app.get<{ Params: { workspaceId: string; channelId: string; ts: string } }>(
-    '/channels/:workspaceId/:channelId/threads/:ts',
-    async (req) => {
-      const { workspaceId, channelId, ts } = req.params;
-      const { rows } = await pool.query(
-        `SELECT ${MESSAGE_COLUMNS} ${MESSAGE_FROM}
-         WHERE m.workspace_id = $1 AND m.channel_id = $2 AND m.thread_ts = $3 AND m.ts <> $3
-           AND ${visibleSql(req, 'm.workspace_id', 'm.channel_id')}
-         ORDER BY m.ts`,
-        [workspaceId, channelId, ts],
-      );
-      return rows.map(toMessage);
-    },
-  );
+  /** Replies we hold for a thread. */
+  app.get<{ Params: { workspaceId: string; channelId: string; ts: string } }>('/channels/:workspaceId/:channelId/threads/:ts', async (req) => {
+    const { workspaceId, channelId, ts } = req.params;
+    const rows = await col.messages
+      .find(and({ workspace_id: workspaceId, channel_id: channelId, thread_ts: ts, ts: { $ne: ts } }, await visibleFilter(req)))
+      .sort({ ts: 1 })
+      .toArray();
+    return hydrateMessages(rows);
+  });
 
   app.get<{ Querystring: { workspaceId?: string; q?: string; limit?: string } }>('/users', async (req, reply) => {
     const { workspaceId, q } = req.query;
     if (!workspaceId) return reply.code(400).send({ error: 'workspaceId is required' });
+    if (!canSeeWorkspace(req, workspaceId)) return [];
     const limit = Math.min(Number(req.query.limit ?? 200) || 200, 1000);
-    const { rows } = await pool.query(
-      `SELECT u.id, u.display_name, u.avatar_url, u.is_bot, u.first_seen_at, u.last_seen_at,
-              count(m.id) AS message_count
-       FROM slack_users u
-       LEFT JOIN messages m ON m.workspace_id = u.workspace_id AND m.user_id = u.id
-       WHERE u.workspace_id = $1 AND ${workspaceSql(req, 'u.workspace_id')} AND ($2::text IS NULL OR u.display_name ILIKE '%' || $2 || '%')
-       GROUP BY u.workspace_id, u.id
-       ORDER BY message_count DESC, u.display_name
-       LIMIT $3`,
-      [workspaceId, q || null, limit],
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      displayName: r.display_name,
-      avatarUrl: r.avatar_url,
-      isBot: r.is_bot,
-      firstSeenAt: r.first_seen_at,
-      lastSeenAt: r.last_seen_at,
-      messageCount: r.message_count,
-    }));
+    const filter: Document = { workspace_id: workspaceId };
+    if (q) filter.display_name = { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+    const [users, counts] = await Promise.all([
+      col.slackUsers.find(filter).toArray(),
+      col.messages.aggregate([{ $match: { workspace_id: workspaceId } }, { $group: { _id: '$user_id', n: { $sum: 1 } } }]).toArray(),
+    ]);
+    const n = new Map(counts.map((c) => [c._id, c.n]));
+    return users
+      .map((u) => ({
+        id: u.id,
+        displayName: u.display_name ?? null,
+        avatarUrl: u.avatar_url ?? null,
+        isBot: Boolean(u.is_bot),
+        firstSeenAt: u.first_seen_at ?? null,
+        lastSeenAt: u.last_seen_at ?? null,
+        messageCount: n.get(u.id) ?? 0,
+      }))
+      .sort((a, b) => b.messageCount - a.messageCount || byText(a.displayName ?? '', b.displayName ?? ''))
+      .slice(0, limit);
   });
 
   /** Every extension install that has reported in, newest activity first. */
   app.get('/collectors', async (req) => {
-    const { rows } = await pool.query(
-      `SELECT k.*, w.name AS workspace_name, COALESCE(a.display_name, su.display_name) AS account_name,
-              k.last_seen_at > now() - ${ONLINE_WINDOW} AS online,
-              (SELECT count(*) FROM sync_runs r WHERE r.collector_id = k.id) AS run_count,
-              (SELECT COALESCE(sum(r.messages_received), 0) FROM sync_runs r WHERE r.collector_id = k.id) AS messages_received
-       FROM collectors k
-       LEFT JOIN workspaces w ON w.id = k.workspace_id
-       LEFT JOIN accounts a ON a.workspace_id = k.workspace_id AND a.user_id = k.account_user_id
-       LEFT JOIN slack_users su ON su.workspace_id = k.workspace_id AND su.id = k.account_user_id
-       WHERE ${workspaceSql(req, 'k.workspace_id')} AND ${accountVisibleSql(req)}
-       ORDER BY k.last_seen_at DESC`,
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      label: r.label,
-      browser: r.browser,
-      version: r.extension_version,
-      workspaceId: r.workspace_id,
-      workspaceName: r.workspace_name,
-      accountId: r.account_user_id,
-      accountName: r.account_name,
-      online: r.online,
-      firstSeenAt: r.first_seen_at,
-      lastSeenAt: r.last_seen_at,
-      runCount: r.run_count,
-      messagesReceived: Number(r.messages_received),
-    }));
+    const collectors = await col.collectors.find(workspaceFilter(req)).sort({ last_seen_at: -1 }).toArray();
+    const pairs = collectors.filter((k) => k.workspace_id && k.account_user_id).map((k) => ({ ws: k.workspace_id, id: k.account_user_id }));
+    const [workspaces, accounts, users, runs] = await Promise.all([
+      col.workspaces.find({ id: { $in: [...new Set(collectors.map((k) => k.workspace_id))] } }).toArray(),
+      pairs.length ? col.accounts.find({ $or: pairs.map((p) => ({ workspace_id: p.ws, user_id: p.id })) }).toArray() : [],
+      lookupMap('slackUsers', pairs),
+      col.syncRuns.aggregate([{ $group: { _id: '$collector_id', n: { $sum: 1 }, received: { $sum: '$messages_received' } } }]).toArray(),
+    ]);
+    const wsName = new Map(workspaces.map((w) => [w.id, w.name ?? null]));
+    const acc = new Map(accounts.map((a) => [`${a.workspace_id}\u0000${a.user_id}`, a]));
+    const runBy = new Map(runs.map((r) => [r._id, r]));
+    return collectors
+      .map((k) => ({ k, a: acc.get(`${k.workspace_id}\u0000${k.account_user_id}`) }))
+      .filter(({ a }) => accountVisible(req, a as never))
+      .map(({ k, a }) => ({
+        id: k.id,
+        label: k.label ?? null,
+        browser: k.browser ?? null,
+        version: k.extension_version ?? null,
+        workspaceId: k.workspace_id ?? null,
+        workspaceName: wsName.get(k.workspace_id) ?? null,
+        accountId: k.account_user_id ?? null,
+        accountName: a?.display_name ?? users.get(`${k.workspace_id}\u0000${k.account_user_id}`)?.display_name ?? null,
+        online: isOnline(k.last_seen_at),
+        firstSeenAt: k.first_seen_at,
+        lastSeenAt: k.last_seen_at,
+        runCount: runBy.get(k.id)?.n ?? 0,
+        messagesReceived: runBy.get(k.id)?.received ?? 0,
+      }));
   });
 
   app.get<{ Querystring: { limit?: string; workspaceId?: string; accountId?: string } }>('/sync-runs', async (req) => {
     const limit = Math.min(Number(req.query.limit ?? 100) || 100, 500);
-    const { rows } = await pool.query(
-      `SELECT r.*, c.name AS channel_name, w.name AS workspace_name,
-              COALESCE(a.display_name, su.display_name) AS account_name, k.label AS collector_label, k.browser
-       FROM sync_runs r
-       JOIN workspaces w ON w.id = r.workspace_id
-       LEFT JOIN channels c ON c.workspace_id = r.workspace_id AND c.id = r.channel_id
-       LEFT JOIN accounts a ON a.workspace_id = r.workspace_id AND a.user_id = r.account_user_id
-       LEFT JOIN slack_users su ON su.workspace_id = r.workspace_id AND su.id = r.account_user_id
-       LEFT JOIN collectors k ON k.id = r.collector_id
-       WHERE ($2::text IS NULL OR r.workspace_id = $2) AND ($3::text IS NULL OR r.account_user_id = $3)
-         AND ${workspaceSql(req, 'r.workspace_id')} AND ${accountVisibleSql(req)}
-       ORDER BY r.started_at DESC LIMIT $1`,
-      [limit, req.query.workspaceId || null, await viewableAccountId(req, req.query.accountId)],
-    );
-    return rows.map((r) => ({
-      id: r.id,
-      workspaceId: r.workspace_id,
-      workspaceName: r.workspace_name,
-      channelId: r.channel_id,
-      channelName: r.channel_name,
-      accountId: r.account_user_id,
-      accountName: r.account_name,
-      collectorId: r.collector_id,
-      collectorLabel: r.collector_label,
-      browser: r.browser,
-      trigger: r.trigger,
-      status: r.status,
-      rangeFrom: r.range_from,
-      oldestSeenAt: r.oldest_seen_at,
-      messagesReceived: r.messages_received,
-      error: r.error,
-      startedAt: r.started_at,
-      finishedAt: r.finished_at,
-    }));
+    const accountId = await viewableAccountId(req, req.query.accountId);
+    const filter = and(req.query.workspaceId ? { workspace_id: req.query.workspaceId } : {}, accountId ? { account_user_id: accountId } : {}, workspaceFilter(req));
+    // Over-fetch a little: runs of accounts this viewer may not see are dropped below.
+    const runs = await col.syncRuns.find(filter).sort({ started_at: -1 }).limit(limit * 2).toArray();
+    const pairs = runs.filter((r) => r.account_user_id).map((r) => ({ ws: r.workspace_id, id: r.account_user_id }));
+    const [workspaces, channels, accounts, users, collectors] = await Promise.all([
+      col.workspaces.find({ id: { $in: [...new Set(runs.map((r) => r.workspace_id))] } }).toArray(),
+      lookupMap('channels', runs.filter((r) => r.channel_id).map((r) => ({ ws: r.workspace_id, id: r.channel_id }))),
+      pairs.length ? col.accounts.find({ $or: pairs.map((p) => ({ workspace_id: p.ws, user_id: p.id })) }).toArray() : [],
+      lookupMap('slackUsers', pairs),
+      col.collectors.find({ id: { $in: [...new Set(runs.map((r) => r.collector_id).filter(Boolean))] } }).toArray(),
+    ]);
+    const wsName = new Map(workspaces.map((w) => [w.id, w.name ?? null]));
+    const acc = new Map(accounts.map((a) => [`${a.workspace_id}\u0000${a.user_id}`, a]));
+    const kBy = new Map(collectors.map((k) => [k.id, k]));
+    return runs
+      .map((r) => ({ r, a: acc.get(`${r.workspace_id}\u0000${r.account_user_id}`) }))
+      .filter(({ r, a }) => wsName.has(r.workspace_id) && accountVisible(req, a as never))
+      .slice(0, limit)
+      .map(({ r, a }) => {
+        const k = r.collector_id ? kBy.get(r.collector_id) : undefined;
+        return {
+          id: r.id,
+          workspaceId: r.workspace_id,
+          workspaceName: wsName.get(r.workspace_id) ?? null,
+          channelId: r.channel_id ?? null,
+          channelName: r.channel_id ? (channels.get(`${r.workspace_id}\u0000${r.channel_id}`)?.name ?? null) : null,
+          accountId: r.account_user_id ?? null,
+          accountName: a?.display_name ?? users.get(`${r.workspace_id}\u0000${r.account_user_id}`)?.display_name ?? null,
+          collectorId: r.collector_id ?? null,
+          collectorLabel: k?.label ?? null,
+          browser: k?.browser ?? null,
+          trigger: r.trigger,
+          status: r.status,
+          rangeFrom: r.range_from ?? null,
+          oldestSeenAt: r.oldest_seen_at ?? null,
+          messagesReceived: r.messages_received ?? 0,
+          error: r.error ?? null,
+          startedAt: r.started_at,
+          finishedAt: r.finished_at ?? null,
+        };
+      });
   });
 }

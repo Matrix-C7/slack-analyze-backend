@@ -6,7 +6,7 @@ coverage/
 .env.local
 .DS_Store
 *.tsbuildinfo
-# Project-local PostgreSQL cluster (scripts/dev-db.ps1)
+# Old project-local PostgreSQL cluster (no longer used; safe to delete)
 .pgdata/
-# Archived Slack files (local file storage)
+# Archived Slack files (FILE_STORAGE=local) and in-flight uploads
 data/

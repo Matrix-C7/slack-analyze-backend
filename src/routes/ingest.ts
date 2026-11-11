@@ -3,7 +3,7 @@ import type { Readable } from 'node:stream';
 import type { FastifyInstance } from 'fastify';
 import { config } from '../config.js';
 import { bus } from '../events.js';
-import { pool } from '../db/pool.js';
+import { col } from '../db/mongo.js';
 import {
   commandResultBody,
   fileClaimBody,
@@ -68,30 +68,32 @@ export async function ingestRoutes(app: FastifyInstance) {
     const body = heartbeatBody.parse(req.body);
     let accountId: string | null = null;
     if (body.workspace) {
-      await upsertWorkspace(pool, body.workspace);
-      accountId = await recordSource(pool, body.workspace.id, body.source);
+      await upsertWorkspace(body.workspace);
+      accountId = await recordSource(body.workspace.id, body.source);
     } else {
-      await recordCollector(pool, body.source.collector, null, null);
+      await recordCollector(body.source.collector, null, null);
     }
-    const { rows: c } = await pool.query('SELECT status, workspace_id FROM collectors WHERE id = $1', [body.source.collector.id]);
-    const status = c[0]?.status ?? 'active';
+    const c = await col.collectors.findOne({ id: body.source.collector.id });
+    const status = c?.status ?? 'active';
     if (status === 'revoked') return reply.code(403).send({ error: 'this browser was revoked by an admin', status });
 
-    const { rows: commands } = await pool.query(
-      `UPDATE collector_commands SET status = 'delivered', delivered_at = now()
-       WHERE collector_id = $1 AND status = 'pending'
-       RETURNING id, type, payload`,
-      [body.source.collector.id],
-    );
-    const { rows: excluded } = await pool.query<{ id: string }>(
-      'SELECT id FROM channels WHERE workspace_id = $1 AND capture_excluded',
-      [body.workspace?.id ?? c[0]?.workspace_id ?? null],
-    );
+    // Hand out pending commands once each: claim them one at a time so two heartbeats never deliver the same one.
+    const commands = [];
+    for (;;) {
+      const cmd = await col.collectorCommands.findOneAndUpdate(
+        { collector_id: body.source.collector.id, status: 'pending' },
+        { $set: { status: 'delivered', delivered_at: new Date() } },
+        { sort: { id: 1 }, returnDocument: 'after' },
+      );
+      if (!cmd) break;
+      commands.push(cmd);
+    }
+    const excluded = await col.channels.distinct('id', { workspace_id: body.workspace?.id ?? c?.workspace_id ?? null, capture_excluded: true });
     return {
       ok: true,
       accountId,
       status,
-      excludedChannelIds: excluded.map((r) => r.id),
+      excludedChannelIds: excluded,
       commands: commands.map((r) => ({ id: Number(r.id), type: r.type, payload: r.payload })),
     };
   });
@@ -99,12 +101,11 @@ export async function ingestRoutes(app: FastifyInstance) {
   /** The extension reports how an admin command went. */
   app.post<{ Params: { id: string } }>('/commands/:id', async (req, reply) => {
     const body = commandResultBody.parse(req.body);
-    const { rowCount } = await pool.query(
-      `UPDATE collector_commands SET status = $2, result = $3, finished_at = now()
-       WHERE id = $1 AND status IN ('pending', 'delivered')`,
-      [req.params.id, body.status, body.result ?? null],
+    const res = await col.collectorCommands.updateOne(
+      { id: Number(req.params.id), status: { $in: ['pending', 'delivered'] } },
+      { $set: { status: body.status, result: body.result ?? null, finished_at: new Date() } },
     );
-    if (!rowCount) return reply.code(404).send({ error: 'command not found' });
+    if (!res.matchedCount) return reply.code(404).send({ error: 'command not found' });
     bus.emitSyncRun({ id: `command:${req.params.id}`, status: body.status });
     return { ok: true };
   });

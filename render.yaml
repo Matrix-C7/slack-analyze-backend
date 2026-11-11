@@ -1,5 +1,6 @@
 # Backend on Render's free web service.
-# Dashboard order: Neon database first, then this service, then Cloudflare R2 keys, then the frontend on Vercel.
+# Order: MongoDB Atlas free cluster first, then the Google Drive refresh token (npm run gdrive:auth),
+# then this service, then the frontend on Vercel.
 # Secrets with sync:false are filled in the Render dashboard (they are not in git).
 services:
   - type: web
@@ -13,10 +14,10 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      - key: DATABASE_URL
+      - key: MONGODB_URI
         sync: false
-      - key: DATABASE_SSL
-        value: "true"
+      - key: MONGODB_DB
+        value: slack_analyze
       - key: INGEST_API_KEY
         sync: false
       - key: COOKIE_SECURE
@@ -26,22 +27,16 @@ services:
       - key: TRUST_PROXY
         value: "true"
       - key: FILE_STORAGE
-        value: s3
+        value: gdrive
       - key: FILE_STORAGE_DIR
         value: /tmp/slack-files
       - key: FILE_MAX_MB
         value: "100"
-      - key: S3_BUCKET
+      - key: GOOGLE_CLIENT_ID
         sync: false
-      - key: S3_ENDPOINT
+      - key: GOOGLE_CLIENT_SECRET
         sync: false
-      - key: S3_REGION
-        value: auto
-      - key: S3_ACCESS_KEY_ID
+      - key: GOOGLE_REFRESH_TOKEN
         sync: false
-      - key: S3_SECRET_ACCESS_KEY
-        sync: false
-      - key: S3_FORCE_PATH_STYLE
-        value: "false"
-      - key: S3_PREFIX
-        value: slack-files/
+      - key: GOOGLE_DRIVE_FOLDER_NAME
+        value: Slack Analyze files

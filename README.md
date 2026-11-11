@@ -2,48 +2,70 @@
 
 The API and database for Slack Analyze.
 
-Capture Slack channel and DM history from the Slack web app, store it in PostgreSQL, and browse, search and analyze it in a Slack-style web UI.
+Capture Slack channel and DM history from the Slack web app, store it in MongoDB (files and images in Google Drive), and browse, search and analyze it in a Slack-style web UI.
 
 ```
 ┌──────────────────────┐   batches (HTTP, real time)   ┌──────────────┐     ┌──────────────┐
-│ Chrome extension     │ ─────────────────────────────▶│ Backend API  │────▶│ PostgreSQL   │
-│ (app.slack.com tab)  │   X-API-Key                   │ Fastify :4000│◀────│ :5432        │
-│ auto-scroll + live   │                               └──────┬───────┘     └──────────────┘
-└──────────────────────┘                                      │ REST + SSE (/api/stream)
-                                                              ▼
-                                                      ┌──────────────┐
-                                                      │ Next.js UI   │
-                                                      │ :3000        │
-                                                      └──────────────┘
+│ Chrome extension     │ ─────────────────────────────▶│ Backend API  │────▶│ MongoDB Atlas│
+│ (app.slack.com tab)  │   X-API-Key                   │ Fastify :4000│◀────│ (free M0)    │
+│ auto-scroll + live   │                               └──┬───┬───────┘     └──────────────┘
+└──────────────────────┘                                  │   └───────────▶ Google Drive (files)
+                                                          │ REST + SSE (/api/stream)
+                                                          ▼
+                                                  ┌──────────────┐
+                                                  │ Next.js UI   │
+                                                  │ :3000        │
+                                                  └──────────────┘
 ```
 
 | Repo | What it is |
 |---|---|
 | [slack-analyze-extension](https://github.com/core7matrix/slack-analyze-extension) | Chrome MV3 extension: scrapes the open Slack tab, auto-scrolls up through history, sends batches to the backend, timed auto-sync, live capture, offline retry queue |
-| [slack-analyze-backend](https://github.com/core7matrix/slack-analyze-backend) | Node 22 + TypeScript + Fastify. Ingest API (extension → DB), read/search/analytics API, Server-Sent Events for live updates. Applies DB migrations on startup |
+| [slack-analyze-backend](https://github.com/core7matrix/slack-analyze-backend) | Node 22 + TypeScript + Fastify. Ingest API (extension → DB), read/search/analytics API, Server-Sent Events for live updates. Creates its MongoDB indexes on startup |
 | [slack-analyze-frontend](https://github.com/core7matrix/slack-analyze-frontend) | Next.js 15 (App Router) + Tailwind: Slack-like message browser, search, analytics, sync status, admin dashboard |
 
 Clone them side by side (`slack-analyze-backend`, `slack-analyze-frontend`, `slack-analyze-extension` in one folder); the frontend's icon export writes into the extension checkout next to it.
 
 
-## Quick start (Windows, no Docker)
+## Quick start
 
-Needs Node 22 and PostgreSQL 17 or 18 installed (`C:\Program Files\PostgreSQL\<version>\bin`). The database script uses the newest installed version.
+Needs Node 22, a free **MongoDB Atlas** cluster and (for the file archive) a **Google account**. Nothing else runs locally besides the API.
 
 ```powershell
 npm install
-powershell -ExecutionPolicy Bypass -File scripts/dev-db.ps1   # project-local cluster in .pgdata on :5433 (created on first run)
-$env:INGEST_API_KEY = 'change-me-too'
-npm run dev                                                   # http://localhost:4000, health: /health
+copy .env.example .env      # then fill in MONGODB_URI and the GOOGLE_* keys (steps below)
+npm run gdrive:auth         # once: sign in to Google, paste the printed GOOGLE_REFRESH_TOKEN into .env
+npm run dev                 # http://localhost:4000, health: /health
 ```
 
-Or in VS Code / Cursor: **Tasks: Run Task → dev: backend** (starts the database first). `DATABASE_URL` defaults to `postgres://slack:change-me@localhost:5433/slack_analyze`; every setting is listed in [.env.example](.env.example). Migrations in [migrations/](migrations/) are applied on startup.
+Or in VS Code / Cursor: **Tasks: Run Task → dev: backend**. Settings are read from `.env` (never committed); every one is listed in [.env.example](.env.example). Indexes are created on startup — there are no migrations to run.
 
-Any PostgreSQL 16+ works: point `DATABASE_URL` at it instead of running `dev-db.ps1`.
+To work without Google Drive, set `FILE_STORAGE=local` (files go to `./data/files`).
 
-## Deploy (Render + Neon + R2)
+### MongoDB Atlas (free)
 
-[render.yaml](render.yaml) describes the free Render web service. Create the Neon database first, then the Render service from this repo, fill in the `sync: false` secrets (`DATABASE_URL`, `INGEST_API_KEY`, `S3_*` for Cloudflare R2), then deploy [slack-analyze-frontend](https://github.com/core7matrix/slack-analyze-frontend) on Vercel with `NEXT_PUBLIC_API_URL` set to the Render URL.
+1. Sign up at [mongodb.com/cloud/atlas](https://www.mongodb.com/cloud/atlas/register) → **Create** a cluster → **M0 Free** (512 MB storage, no card needed). Pick a region near your Render region (e.g. Singapore).
+2. **Database Access** → add a database user (password auth) with *Read and write to any database*.
+3. **Network Access** → add `0.0.0.0/0` (Render's free service has no fixed outbound IP). The database user's password is what protects it, so make it long.
+4. **Connect → Drivers** → copy the `mongodb+srv://…` string, put the password in, and set it as `MONGODB_URI`. The database (`MONGODB_DB`, default `slack_analyze`) is created on first write.
+
+Admin → Overview shows the space used ("Database"); M0 allows 512 MB.
+
+### Google Drive (personal account, free 15 GB)
+
+Files are kept in a folder of your own Drive (default *Slack Analyze files*). The backend signs in with an OAuth refresh token for the **`drive.file`** scope, so it can only see and change files it created — nothing else in your Drive.
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → create a project → **APIs & Services → Library** → enable **Google Drive API**.
+2. **OAuth consent screen** (Google Auth Platform) → *External* → app name and your email → under *Data access* add the scope `.../auth/drive.file`.
+3. **Audience → Publish app → In production.** `drive.file` is a non-sensitive scope, so Google doesn't review the app. **Don't skip this:** while the app is in *Testing*, Google expires the refresh token after 7 days and uploads stop.
+4. **Credentials → Create credentials → OAuth client ID → Desktop app**. Put the client id and secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
+5. `npm run gdrive:auth`, open the printed link, sign in with the Google account whose Drive should hold the files (Google warns that the app is unverified: *Advanced → Go to …*), and copy the printed `GOOGLE_REFRESH_TOKEN` into `.env` and the Render dashboard.
+
+The folder is created on the first upload and remembered in the database. If the token stops working (password change, or access removed at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)), run `npm run gdrive:auth` again and update the token.
+
+## Deploy (Render + MongoDB Atlas + Google Drive)
+
+[render.yaml](render.yaml) describes the free Render web service. Create the Atlas cluster and the Google refresh token first (above), then the Render service from this repo, fill in the `sync: false` secrets (`MONGODB_URI`, `INGEST_API_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`), then deploy [slack-analyze-frontend](https://github.com/core7matrix/slack-analyze-frontend) on Vercel with `NEXT_PUBLIC_API_URL` set to the Render URL.
 
 ## Files and images
 
@@ -62,40 +84,37 @@ Files nobody references any more (message deleted, conversation purged, retentio
 
 | `FILE_STORAGE` | Use for | Settings |
 |---|---|---|
-| `local` (default) | One server, local development | `FILE_STORAGE_DIR` (default `./data/files` in this repo) |
-| `s3` | Any S3-compatible bucket — **Cloudflare R2** (10 GB free, no egress fees), **Backblaze B2** (10 GB free), **MinIO** (self-hosted), AWS S3, Google Cloud Storage (interoperability keys) | `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION` (`auto` for R2), `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE=true` for MinIO, `S3_PREFIX` |
+| `gdrive` (default) | Your personal Google Drive (15 GB free, shared with Gmail and Photos) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `GOOGLE_DRIVE_FOLDER_NAME`, optional `GOOGLE_DRIVE_FOLDER_ID` |
+| `local` | Local development without Google | `FILE_STORAGE_DIR` (default `./data/files` in this repo) |
 
-`FILE_MAX_MB` (default 100) is the server's hard cap per file. Uploads stream to disk while hashing, so large files are never held in memory.
+`FILE_MAX_MB` (default 100) is the server's hard cap per file. Uploads stream to a temp file while hashing, then go to Drive as a resumable upload, so large files are never held in memory. In Drive each file is named after its SHA-256; the dashboard shows the original names. The dashboard gets files through the API (with byte ranges for video), never through shared Drive links.
 
 ## Database
 
-Schema: [migrations/001_init.sql](migrations/001_init.sql), multi-account additions in [002_multi_account.sql](migrations/002_multi_account.sql) (`messages.captured_by` = first account that delivered the row).
+MongoDB, one collection per former table (field names unchanged). Indexes are created on startup in [src/db/mongo.ts](src/db/mongo.ts). Ids the dashboard and extension use (messages, files, dashboard users, commands, audit entries) are numbers from the `counters` collection.
 
-| Table | Purpose |
+| Collection | Purpose |
 |---|---|
-| `workspaces` | Slack teams (`T…` id, name) |
-| `channels` | Every conversation: `type` = `public` / `private` / `dm` / `group_dm`, topic, sync bookkeeping (`oldest_synced_ts`, `newest_synced_ts`, `reached_start`, `last_synced_at`) |
+| `workspaces` | Slack teams (`T…` id, name, logo, retention) |
+| `channels` | Every conversation: `type` = `public` / `private` / `dm` / `group_dm`, topic, sync bookkeeping (`oldest_synced_ts`, `newest_synced_ts`, `reached_start`, `last_synced_at`), hidden / excluded flags |
 | `slack_users` | People seen in messages, avatar, first/last seen |
-| `messages` | One row per message, unique on `(workspace_id, channel_id, ts)`; text, sender, thread fields, edited/bot flags, `raw` JSON, generated `search_vector` |
-| `message_reactions` | Emoji + count per message (replaced on every capture) |
+| `messages` | One document per message, unique on `(workspace_id, channel_id, ts)`: text, sender, thread fields, edited/bot flags, `reactions[]` (replaced on every capture), `mentions[]`, `captured_by` (first account that delivered it) |
 | `message_files` | Attachments: Slack file id, link, download/preview URLs, archive `status` (`pending` / `stored` / `failed` / `skipped`), download lease and retry state, stored blob |
-| `file_blobs` | Archived file contents, one row per SHA-256: size, type, storage driver and key |
-| `message_mentions` | `@user` mentions |
-| `sync_runs` | One row per channel per sync run: trigger, status, range, messages received, errors, account + collector |
+| `file_blobs` | Archived file contents, one per SHA-256: size, type, storage driver and key (the Drive file id) |
+| `sync_runs` | One per channel per sync run: trigger, status, range, messages received, errors, account + collector |
 | `accounts` | Slack users signed in to a capturing browser (`workspace_id`, `user_id`) |
-| `collectors` | Extension installs: id, label, browser, version, last account, `last_seen_at` |
+| `collectors` | Extension installs: id, label, browser, version, last account, `last_seen_at`, status |
 | `channel_accounts` | Which account sees / captured which conversation, its name for it, messages delivered |
-| `app_users`, `app_sessions` | Dashboard logins (scrypt password hashes, hashed session tokens) |
+| `app_users`, `app_sessions` | Dashboard logins (scrypt password hashes, hashed session tokens; a TTL index removes expired sessions). Community and account grants are kept on the user |
 | `audit_log` | Admin actions |
 | `deleted_messages` | Tombstones so deleted messages aren't re-captured |
 | `collector_commands` | Commands queued for extension installs and their results |
-| `channel_daily_stats` (view) | Messages and active people per channel per day |
+| `channel_reads` | How far each dashboard user has read in each conversation |
+| `counters`, `settings` | Number sequences; the Google Drive folder id |
 
-Re-capturing is safe: ingest is an upsert, so overlapping ranges only update existing rows.
+Re-capturing is safe: ingest is an upsert, so overlapping ranges only update existing documents.
 
-Search uses PostgreSQL full-text (`websearch_to_tsquery`: words, `"exact phrase"`, `-exclude`, `or`) plus trigram substring matching for partial words, URLs and code.
-
-To change the schema, add a new file such as `migrations/009_add_x.sql` and restart the backend — never edit an applied migration.
+Search works like a web search: every word must appear (also inside longer words, URLs and code), `"exact phrase"`, `-exclude`, and `or` between alternatives. It matches message text and sender names, and ranks text matches above name matches.
 
 ## API
 

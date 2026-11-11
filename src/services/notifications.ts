@@ -1,4 +1,4 @@
-import { pool } from '../db/pool.js';
+import { col } from '../db/mongo.js';
 import type { NotificationEvent } from '../events.js';
 import type { IngestMessagesBody } from '../schemas.js';
 import type { NewMessage } from './ingest.js';
@@ -21,33 +21,24 @@ export async function buildNotification(body: IngestMessagesBody, fresh: NewMess
 
   const { workspace, channel } = body;
   const accountId = body.source?.account?.userId ?? null;
-  const { rows: ctx } = await pool.query(
-    `SELECT w.name AS workspace_name, w.icon_url, c.type, c.is_hidden,
-            COALESCE((SELECT ca.channel_name FROM channel_accounts ca
-                       WHERE ca.workspace_id = c.workspace_id AND ca.channel_id = c.id AND ca.account_user_id = $3::text),
-                     c.name) AS channel_name
-     FROM channels c JOIN workspaces w ON w.id = c.workspace_id
-     WHERE c.workspace_id = $1 AND c.id = $2`,
-    [workspace.id, channel.id, accountId],
-  );
-  if (!ctx[0]) return null;
-
   const userIds = [...new Set(messages.map((m) => m.userId).filter((id): id is string => Boolean(id)))];
-  const { rows: users } = await pool.query<{ id: string; name: string | null; avatar_url: string | null }>(
-    `SELECT id, COALESCE(display_name, real_name) AS name, avatar_url FROM slack_users
-     WHERE workspace_id = $1 AND id = ANY($2::text[])`,
-    [workspace.id, userIds],
-  );
-  const byId = new Map(users.map((u) => [u.id, u]));
+  const [c, w, link, users] = await Promise.all([
+    col.channels.findOne({ workspace_id: workspace.id, id: channel.id }),
+    col.workspaces.findOne({ id: workspace.id }),
+    accountId ? col.channelAccounts.findOne({ workspace_id: workspace.id, channel_id: channel.id, account_user_id: accountId }) : null,
+    col.slackUsers.find({ workspace_id: workspace.id, id: { $in: userIds } }).toArray(),
+  ]);
+  if (!c || !w) return null;
+  const byId = new Map(users.map((u) => [u.id as string, u]));
 
   return {
     workspaceId: workspace.id,
-    workspaceName: ctx[0].workspace_name,
-    workspaceIconUrl: ctx[0].icon_url,
+    workspaceName: w.name ?? null,
+    workspaceIconUrl: w.icon_url ?? null,
     channelId: channel.id,
-    channelName: ctx[0].channel_name,
-    channelType: ctx[0].type,
-    channelHidden: ctx[0].is_hidden,
+    channelName: link?.channel_name ?? c.name,
+    channelType: c.type,
+    channelHidden: Boolean(c.is_hidden),
     accountId,
     messages: messages.map((m) => {
       const u = m.userId ? byId.get(m.userId) : undefined;
@@ -55,7 +46,7 @@ export async function buildNotification(body: IngestMessagesBody, fresh: NewMess
         ts: m.ts,
         threadTs: m.threadTs,
         userId: m.userId,
-        userName: m.userName ?? u?.name ?? null,
+        userName: m.userName ?? u?.display_name ?? u?.real_name ?? null,
         avatarUrl: m.avatarUrl ?? u?.avatar_url ?? null,
         isBot: m.isBot,
         text: m.text.length > PREVIEW_CHARS ? `${m.text.slice(0, PREVIEW_CHARS)}…` : m.text,
