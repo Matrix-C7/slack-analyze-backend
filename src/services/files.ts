@@ -6,7 +6,7 @@ import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { Document } from 'mongodb';
 import { config } from '../config.js';
-import { col, nextId } from '../db/mongo.js';
+import { col, isDuplicateKey, nextId } from '../db/mongo.js';
 import type { FileInput } from '../schemas.js';
 import { fileStore, tempDir } from './fileStore.js';
 
@@ -80,6 +80,27 @@ export async function upsertMessageFile(
   input: FileInput,
 ): Promise<boolean> {
   const f = normalize(msg.workspaceId, input);
+  // Several browsers in the same conversation ingest the same message at the same moment: the insert below is
+  // an upsert on a unique (message_id, file_key), and the loser of that race merges into the winner's row.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await upsertMessageFileOnce(msg, f);
+    } catch (err) {
+      if (attempt >= 2 || !(err instanceof FileRaceLost || isDuplicateKey(err))) throw err;
+    }
+  }
+}
+
+class FileRaceLost extends Error {}
+
+/** One row per file of a message: the Slack file id when known, else the captured URL. */
+export const fileKey = (f: { slackFileId?: string | null; slack_file_id?: string | null; url: string }) =>
+  f.slackFileId ?? f.slack_file_id ?? f.url;
+
+async function upsertMessageFileOnce(
+  msg: { workspaceId: string; channelId: string; messageId: number; sentAt: Date },
+  f: NormalizedFile,
+): Promise<boolean> {
   const hasSource = Boolean(f.downloadUrl || f.thumbUrl);
   const candidates = await col.messageFiles
     .find({ message_id: msg.messageId, $or: [...(f.slackFileId ? [{ slack_file_id: f.slackFileId }] : []), { url: f.url }] })
@@ -110,9 +131,11 @@ export async function upsertMessageFile(
     await col.messageFiles.updateOne({ id: found.id }, { $set: set });
     row = { ...found, ...set };
   } else {
+    const key = fileKey(f);
     row = {
       id: await nextId('message_files'),
       message_id: msg.messageId,
+      file_key: key,
       workspace_id: msg.workspaceId,
       channel_id: msg.channelId,
       sent_at: msg.sentAt,
@@ -135,7 +158,10 @@ export async function upsertMessageFile(
       stored_at: null,
       created_at: new Date(),
     };
-    await col.messageFiles.insertOne(row);
+    const { message_id: _m, file_key: _k, ...insert } = row;
+    const res = await col.messageFiles.updateOne({ message_id: msg.messageId, file_key: key }, { $setOnInsert: insert }, { upsert: true });
+    // Another browser stored this file a moment ago: start over and merge into its row.
+    if (!res.upsertedCount) throw new FileRaceLost();
   }
   if (row.status !== 'pending') return false;
 

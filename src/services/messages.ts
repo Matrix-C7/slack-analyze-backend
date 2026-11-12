@@ -28,8 +28,16 @@ export async function hydrateMessages(docs: Document[]): Promise<Record<string, 
   const blobs = new Map(
     (await col.fileBlobs.find({ sha256: { $in: [...new Set(files.map((f) => f.blob_sha256).filter(Boolean))] } }).toArray()).map((b) => [b.sha256, b]),
   );
+  // One entry per Slack file of a message; a stored copy wins over one still pending.
   const filesBy = new Map<number, Document[]>();
-  for (const f of files) filesBy.set(f.message_id, [...(filesBy.get(f.message_id) ?? []), f]);
+  for (const f of files) {
+    const list = filesBy.get(f.message_id) ?? [];
+    const key = f.slack_file_id ?? f.url;
+    const i = list.findIndex((x) => (x.slack_file_id ?? x.url) === key);
+    if (i < 0) list.push(f);
+    else if (list[i].status !== 'stored' && f.status === 'stored') list[i] = f;
+    filesBy.set(f.message_id, list);
+  }
 
   return docs.map((m) => {
     const c = channels.get(key(m.workspace_id, m.channel_id));

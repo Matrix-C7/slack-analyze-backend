@@ -60,6 +60,7 @@ export async function upsertRetry<T>(fn: () => Promise<T>): Promise<T> {
 
 /** Creates the indexes the API relies on. Idempotent; runs on every start (replaces the SQL migrations). */
 export async function ensureIndexes(): Promise<void> {
+  await dedupeMessageFiles();
   const ix = (coll: Collection<Doc>, specs: { key: Doc; unique?: boolean; name?: string; partialFilterExpression?: Doc; expireAfterSeconds?: number }[]) =>
     coll.createIndexes(specs.map((s) => ({ ...s, key: s.key })));
   await Promise.all([
@@ -78,6 +79,8 @@ export async function ensureIndexes(): Promise<void> {
     ix(col.messageFiles, [
       { key: { id: 1 }, unique: true },
       { key: { message_id: 1 } },
+      // One row per file of a message, however many browsers capture it at once.
+      { key: { message_id: 1, file_key: 1 }, unique: true, name: 'message_file_unique', partialFilterExpression: { file_key: { $type: 'string' } } },
       { key: { workspace_id: 1, status: 1, sent_at: -1 } },
       { key: { workspace_id: 1, slack_file_id: 1 } },
       { key: { blob_sha256: 1 } },
@@ -97,6 +100,25 @@ export async function ensureIndexes(): Promise<void> {
     ix(col.collectorCommands, [{ key: { id: 1 }, unique: true }, { key: { collector_id: 1, status: 1 } }]),
     ix(col.channelReads, [{ key: { app_user_id: 1, workspace_id: 1, channel_id: 1 }, unique: true }]),
   ]);
+}
+
+/**
+ * Before the unique (message_id, file_key) index existed, browsers capturing the same message at the same
+ * moment each inserted the message's files, so one attachment showed up several times. Gives every row its
+ * key and keeps one row per file (a stored one first, then the oldest).
+ */
+async function dedupeMessageFiles(): Promise<void> {
+  await col.messageFiles.updateMany({ file_key: { $exists: false } }, [{ $set: { file_key: { $ifNull: ['$slack_file_id', '$url'] } } }]);
+  const groups = await col.messageFiles
+    .aggregate([
+      { $addFields: { _stored: { $cond: [{ $eq: ['$status', 'stored'] }, 0, 1] } } },
+      { $sort: { _stored: 1, id: 1 } },
+      { $group: { _id: { m: '$message_id', k: '$file_key' }, ids: { $push: '$id' }, n: { $sum: 1 } } },
+      { $match: { n: { $gt: 1 } } },
+    ])
+    .toArray();
+  const extra = groups.flatMap((g) => (g.ids as number[]).slice(1));
+  if (extra.length) await col.messageFiles.deleteMany({ id: { $in: extra } });
 }
 
 /**
