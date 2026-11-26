@@ -11,6 +11,7 @@ import {
   heartbeatBody,
   ingestChannelsBody,
   ingestMessagesBody,
+  ingestReactionsBody,
   syncRunFinishBody,
   syncRunStartBody,
 } from '../schemas.js';
@@ -20,6 +21,7 @@ import {
   recordCollector,
   ingestChannels,
   ingestMessages,
+  ingestReactions,
   recordSource,
   startSyncRun,
   upsertWorkspace,
@@ -138,6 +140,24 @@ export async function ingestRoutes(app: FastifyInstance) {
     }
     const { newMessages: _fresh, ...counts } = result;
     return { ok: true, ...counts };
+  });
+
+  /** Live reaction changes (see ingestReactionsBody). Tells open dashboards / desktop apps to refresh those messages. */
+  app.post('/reactions', async (req) => {
+    const body = ingestReactionsBody.parse(req.body);
+    const changed = await ingestReactions(body);
+    for (const [channelId, c] of changed) {
+      const ch = await col.channels.findOne({ workspace_id: body.workspace.id, id: channelId }, { projection: { name: 1 } });
+      bus.emitMessages({
+        workspaceId: body.workspace.id,
+        channelId,
+        channelName: (ch?.name as string | undefined) ?? channelId,
+        inserted: 0,
+        updated: c.updated,
+        newestTs: c.newestTs,
+      });
+    }
+    return { ok: true, applied: [...changed.values()].reduce((n, c) => n + c.updated, 0) };
   });
 
   /**

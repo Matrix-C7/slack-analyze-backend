@@ -100,6 +100,7 @@ async function userView(u: Document) {
     workspaceIds: [...(u.workspace_ids ?? [])].sort(),
     allAccounts: u.all_accounts !== false,
     accounts: [...(u.account_grants ?? [])].sort((a, b) => byText(a.workspaceId, b.workspaceId) || byText(a.accountId, b.accountId)),
+    avatarVersion: u.avatar_updated_at ? new Date(u.avatar_updated_at).getTime() : null,
   };
 }
 
@@ -290,7 +291,7 @@ export async function adminRoutes(app: FastifyInstance) {
   // Dashboard users
   // ---------------------------------------------------------------------------
   app.get('/users', async () => {
-    const users = await col.appUsers.find({}).toArray();
+    const users = await col.appUsers.find({}, { projection: { avatar: 0 } }).toArray();
     users.sort((a, b) => byText(a.role, b.role) || byText(lower(a.email), lower(b.email)));
     return Promise.all(users.map(userView));
   });
