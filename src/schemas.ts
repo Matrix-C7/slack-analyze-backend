@@ -82,6 +82,25 @@ export const ingestMessagesBody = z.object({
   source: sourceInput.nullish(),
 });
 
+/**
+ * Live reaction changes from Slack's real-time socket (reaction_added / reaction_removed). Every browser signed in to
+ * the workspace sees the same event, so each carries Slack's event_ts and the backend applies it once.
+ */
+export const reactionEventInput = z.object({
+  channelId: z.string().regex(/^[CDG][A-Z0-9]+$/),
+  ts: slackTs,
+  emoji: z.string().min(1).max(200),
+  userId: z.string().max(200).nullish(),
+  added: z.boolean(),
+  eventTs: z.string().min(1).max(64),
+});
+
+export const ingestReactionsBody = z.object({
+  workspace: workspaceInput,
+  events: z.array(reactionEventInput).max(500),
+  source: sourceInput.nullish(),
+});
+
 export const heartbeatBody = z.object({
   workspace: workspaceInput.nullish(), // null when no Slack tab is open
   source: sourceInput,

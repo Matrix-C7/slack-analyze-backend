@@ -1,3 +1,6 @@
+import type { z } from 'zod';
+import type { ingestReactionsBody } from '../schemas.js';
+type IngestReactionsBody = z.infer<typeof ingestReactionsBody>;
 import type { AnyBulkWriteOperation, Document } from 'mongodb';
 import { col, isDuplicateKey, lit, nextId, upsertRetry } from '../db/mongo.js';
 import { upsertMessageFile } from './files.js';
@@ -449,4 +452,47 @@ export async function finishSyncRun(id: string, input: { status: string; error?:
   if (input.oldestSeenAt) set.oldest_seen_at = new Date(input.oldestSeenAt);
   const res = await col.syncRuns.updateOne({ id }, { $set: set });
   return res.matchedCount > 0;
+}
+
+/**
+ * Applies live reaction changes to stored messages: +1 / -1 on that emoji (removed at 0). Each Slack event is applied
+ * once even when several browsers report it. Messages we don't hold yet are skipped (the next capture brings them).
+ * Returns the conversations that changed, with how many messages and the newest ts.
+ */
+export async function ingestReactions(body: IngestReactionsBody): Promise<Map<string, { updated: number; newestTs: string }>> {
+  const changed = new Map<string, { updated: number; newestTs: string }>();
+  const ws = body.workspace.id;
+  for (const e of body.events) {
+    const key = [ws, e.eventTs, e.userId ?? '', e.channelId, e.ts, e.emoji, e.added ? '+' : '-'].join('|');
+    try {
+      await col.reactionEvents.insertOne({ _id: key, created_at: new Date() });
+    } catch (err) {
+      if (isDuplicateKey(err)) continue; // another browser already reported this event
+      throw err;
+    }
+    const emoji = lit(e.emoji);
+    const rs = { $ifNull: ['$reactions', []] };
+    const bumped = (delta: number) => ({
+      $map: {
+        input: rs,
+        as: 'r',
+        in: { $cond: [{ $eq: ['$$r.emoji', emoji] }, { emoji: '$$r.emoji', count: { $add: ['$$r.count', delta] } }, '$$r'] },
+      },
+    });
+    const reactions = e.added
+      ? { $cond: [{ $in: [emoji, { $map: { input: rs, as: 'r', in: '$$r.emoji' } }] }, bumped(1), { $concatArrays: [rs, [{ emoji, count: 1 }]] }] }
+      : { $filter: { input: bumped(-1), as: 'r', cond: { $gt: ['$$r.count', 0] } } };
+    const res = await col.messages.updateOne(
+      { workspace_id: ws, channel_id: e.channelId, ts: e.ts },
+      [{ $set: { reactions, updated_at: '$$NOW' } }],
+    );
+    if (!res.matchedCount) continue;
+    const c = changed.get(e.channelId);
+    if (!c) changed.set(e.channelId, { updated: 1, newestTs: e.ts });
+    else {
+      c.updated++;
+      if (Number(e.ts) > Number(c.newestTs)) c.newestTs = e.ts;
+    }
+  }
+  return changed;
 }

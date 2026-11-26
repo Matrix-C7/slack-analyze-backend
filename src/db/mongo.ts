@@ -35,6 +35,8 @@ export const col = {
   deletedMessages: c('deleted_messages'),
   collectorCommands: c('collector_commands'),
   channelReads: c('channel_reads'),
+  /** Live reaction events already applied (de-duplicates the same event sent by several browsers). */
+  reactionEvents: c<{ _id: string; created_at: Date }>('reaction_events'),
 };
 
 /** Reserves `n` consecutive ids for a sequence and returns the first one. */
@@ -99,6 +101,8 @@ export async function ensureIndexes(): Promise<void> {
     ix(col.deletedMessages, [{ key: { workspace_id: 1, channel_id: 1, ts: 1 }, unique: true }]),
     ix(col.collectorCommands, [{ key: { id: 1 }, unique: true }, { key: { collector_id: 1, status: 1 } }]),
     ix(col.channelReads, [{ key: { app_user_id: 1, workspace_id: 1, channel_id: 1 }, unique: true }]),
+    // Only needed while browsers may still send the same event: dropped after two days.
+    ix(col.reactionEvents as unknown as Collection<Document>, [{ key: { created_at: 1 }, expireAfterSeconds: 2 * 86400 }]),
   ]);
 }
 

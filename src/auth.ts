@@ -28,6 +28,8 @@ export interface SessionUser {
   allAccounts: boolean;
   workspaceIds: string[];
   accountGrants: AccountGrant[];
+  /** Profile photo version (ms since epoch of the last change), or null without a photo. Used to bust caches. */
+  avatarVersion: number | null;
 }
 
 declare module 'fastify' {
@@ -87,6 +89,7 @@ export function toSessionUser(u: Document): SessionUser {
     allAccounts: u.all_accounts !== false,
     workspaceIds: u.workspace_ids ?? [],
     accountGrants: u.account_grants ?? [],
+    avatarVersion: u.avatar_updated_at ? new Date(u.avatar_updated_at).getTime() : null,
   };
 }
 
@@ -124,7 +127,7 @@ export async function loadUser(req: FastifyRequest): Promise<SessionUser | undef
     { $set: { last_used_at: new Date() } },
   );
   if (!s) return undefined;
-  const u = await col.appUsers.findOne({ id: s.user_id, is_active: true });
+  const u = await col.appUsers.findOne({ id: s.user_id, is_active: true }, { projection: { avatar: 0 } });
   return u ? toSessionUser(u) : undefined;
 }
 
