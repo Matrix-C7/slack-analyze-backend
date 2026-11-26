@@ -121,6 +121,12 @@ export async function ingestRoutes(app: FastifyInstance) {
   app.post('/messages', async (req) => {
     const body = ingestMessagesBody.parse(req.body);
     const result = await ingestMessages(body);
+    if (body.via === 'notification') {
+      req.log.info(
+        { workspaceId: body.workspace.id, channelId: body.channel.id, received: body.messages.length, inserted: result.inserted, collector: body.source?.collector.id },
+        'notification backup: live capture had missed messages',
+      );
+    }
     if (result.inserted + result.updated > 0) {
       bus.emitMessages({
         workspaceId: body.workspace.id,

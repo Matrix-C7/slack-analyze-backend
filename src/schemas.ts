@@ -78,6 +78,9 @@ export const ingestMessagesBody = z.object({
   reachedStart: z.boolean().optional(),
   // 'rtm' = read from Slack's real-time socket (any conversation, mentions as @U… ids); 'dom' = read from the page
   origin: z.enum(['dom', 'rtm']).optional(),
+  // 'notification' = the extension fetched these because a Slack desktop notification showed a message that live
+  // capture had missed (backup signal). Stored like any live message.
+  via: z.enum(['notification']).nullish(),
   messages: z.array(messageInput).max(1000),
   source: sourceInput.nullish(),
 });
