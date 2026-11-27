@@ -438,6 +438,7 @@ export async function readRoutes(app: FastifyInstance) {
           trigger: r.trigger,
           status: r.status,
           rangeFrom: r.range_from ?? null,
+          commandId: r.command_id ?? null,
           oldestSeenAt: r.oldest_seen_at ?? null,
           messagesReceived: r.messages_received ?? 0,
           error: r.error ?? null,

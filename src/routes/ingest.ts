@@ -89,6 +89,7 @@ export async function ingestRoutes(app: FastifyInstance) {
       );
       if (!cmd) break;
       commands.push(cmd);
+      bus.emitSyncRun({ id: `command:${cmd.id}`, status: 'delivered' });
     }
     const excluded = await col.channels.distinct('id', { workspace_id: body.workspace?.id ?? c?.workspace_id ?? null, capture_excluded: true });
     return {

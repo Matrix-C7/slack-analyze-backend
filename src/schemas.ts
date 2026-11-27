@@ -138,6 +138,8 @@ export const syncRunStartBody = z.object({
   channel: channelInput.nullish(),
   trigger: z.enum(['manual', 'auto', 'live']),
   rangeFrom: z.string().datetime().nullish(),
+  /** Admin command (dashboard / desktop app) that started this run. */
+  commandId: z.number().int().positive().nullish(),
   source: sourceInput.nullish(),
 });
 
