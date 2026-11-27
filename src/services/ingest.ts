@@ -416,6 +416,7 @@ export async function startSyncRun(input: {
   channel?: ChannelInput | null;
   trigger: 'manual' | 'auto' | 'live';
   rangeFrom?: string | null;
+  commandId?: number | null;
   source?: SourceInput | null;
 }): Promise<void> {
   await upsertWorkspace(input.workspace);
@@ -432,6 +433,7 @@ export async function startSyncRun(input: {
         trigger: input.trigger,
         status: 'running',
         range_from: input.rangeFrom ? new Date(input.rangeFrom) : null,
+        command_id: input.commandId ?? null,
         oldest_seen_at: null,
         messages_received: 0,
         error: null,

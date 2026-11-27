@@ -3,6 +3,7 @@ import type { Document } from 'mongodb';
 import { z } from 'zod';
 import { audit, hashPassword, requireAdmin } from '../auth.js';
 import { config } from '../config.js';
+import { bus } from '../events.js';
 import { col, db, deleteChannelData, deleteMessages, isDuplicateKey, nextId } from '../db/mongo.js';
 import { fileStore } from '../services/fileStore.js';
 import { lookupMap } from '../services/messages.js';
@@ -38,9 +39,26 @@ const collectorPatch = z.object({
   notes: z.string().max(2000).nullish(),
   status: z.enum(['active', 'paused', 'revoked']).optional(),
 });
+/**
+ * How far back a sync started from the dashboard / desktop app reads. Omitted = the browser's own settings.
+ * mode: incremental = stop at the newest message already captured (1 h overlap); full = read the whole range again.
+ */
+const syncOptions = z.object({
+  range: z.object({ value: z.number().int().min(1).max(1200), unit: z.enum(['days', 'months', 'all']) }).optional(),
+  mode: z.enum(['incremental', 'full']).optional(),
+});
 const commandCreate = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('sync_channels'), payload: z.object({ channelIds: z.array(z.string().max(32)).min(1).max(2000) }) }),
-  z.object({ type: z.literal('sync_open'), payload: z.object({}).default({}) }),
+  z.object({
+    type: z.literal('sync_channels'),
+    payload: syncOptions
+      .extend({
+        channelIds: z.array(z.string().max(32)).min(1).max(2000).optional(),
+        /** ids = channelIds; selected = the browser's own "Selected for sync" list; all = every conversation it knows. */
+        scope: z.enum(['ids', 'selected', 'all']).default('ids'),
+      })
+      .refine((p) => p.scope !== 'ids' || (p.channelIds?.length ?? 0) > 0, { message: 'channelIds is required when scope is ids' }),
+  }),
+  z.object({ type: z.literal('sync_open'), payload: syncOptions.default({}) }),
   z.object({ type: z.literal('refresh_channels'), payload: z.object({}).default({}) }),
   z.object({ type: z.literal('stop'), payload: z.object({}).default({}) }),
   z.object({
@@ -492,6 +510,7 @@ export async function adminRoutes(app: FastifyInstance) {
       finished_at: null,
     });
     await audit(req, `command.${cmd.type}`, req.params.id, cmd.payload);
+    bus.emitSyncRun({ id: `command:${id}`, status: 'pending' });
     return { ok: true, id };
   });
 
