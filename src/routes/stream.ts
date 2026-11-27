@@ -1,6 +1,6 @@
 import { isAdmin, requireUser, visibleWorkspaceIds } from '../auth.js';
 import type { FastifyInstance } from 'fastify';
-import { bus, type MessagesIngestedEvent, type NotificationEvent, type SyncRunEvent } from '../events.js';
+import { bus, type AppPingEvent, type MessagesIngestedEvent, type NotificationEvent, type SyncRunEvent } from '../events.js';
 
 /** Server-Sent Events: pushes ingest activity to open frontend tabs so views refresh live. */
 export async function streamRoutes(app: FastifyInstance) {
@@ -32,6 +32,8 @@ export async function streamRoutes(app: FastifyInstance) {
       const { channelHidden: _hidden, ...data } = e;
       send('notification', data);
     };
+    const userId = req.user!.id;
+    const onAppPing = (e: AppPingEvent) => (!e.userIds || e.userIds.includes(userId)) && send('app_ping', {});
     const heartbeat = setInterval(() => {
       res.write(': ping\n\n');
       visibleWorkspaceIds(req).then((ids) => (allowed = ids), () => {});
@@ -40,11 +42,13 @@ export async function streamRoutes(app: FastifyInstance) {
     bus.on('messages', onMessages);
     bus.on('sync_run', onRun);
     bus.on('notification', onNotification);
+    bus.on('app_ping', onAppPing);
     req.raw.on('close', () => {
       clearInterval(heartbeat);
       bus.off('messages', onMessages);
       bus.off('sync_run', onRun);
       bus.off('notification', onNotification);
+      bus.off('app_ping', onAppPing);
     });
   });
 }

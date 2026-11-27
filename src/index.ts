@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { client, db, ensureIndexes } from './db/mongo.js';
 import { adminRoutes } from './routes/admin.js';
 import { analyticsRoutes } from './routes/analytics.js';
+import { appAdminRoutes, appRoutes } from './routes/app.js';
 import { authRoutes } from './routes/auth.js';
 import { fileRoutes } from './routes/files.js';
 import { ingestRoutes } from './routes/ingest.js';
@@ -37,6 +38,8 @@ app.get('/health', async () => {
 await app.register(ingestRoutes, { prefix: '/api/ingest' });
 await app.register(authRoutes, { prefix: '/api/auth' });
 await app.register(adminRoutes, { prefix: '/api/admin' });
+await app.register(appAdminRoutes, { prefix: '/api/admin/app' });
+await app.register(appRoutes, { prefix: '/api/app' });
 await app.register(readRoutes, { prefix: '/api' });
 await app.register(searchRoutes, { prefix: '/api' });
 await app.register(analyticsRoutes, { prefix: '/api' });

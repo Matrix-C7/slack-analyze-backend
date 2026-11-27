@@ -9,6 +9,11 @@ export interface MessagesIngestedEvent {
   newestTs: string | null;
 }
 
+/** Desktop apps of these users (null = everyone) should check in now: new notification, update or server policy. */
+export interface AppPingEvent {
+  userIds: number[] | null;
+}
+
 export interface SyncRunEvent {
   id: string;
   status: string;
@@ -47,6 +52,9 @@ class Bus extends EventEmitter {
   }
   emitSyncRun(e: SyncRunEvent) {
     this.emit('sync_run', e);
+  }
+  emitAppPing(e: AppPingEvent) {
+    this.emit('app_ping', e);
   }
 }
 
