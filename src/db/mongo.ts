@@ -37,6 +37,13 @@ export const col = {
   channelReads: c('channel_reads'),
   /** Live reaction events already applied (de-duplicates the same event sent by several browsers). */
   reactionEvents: c<{ _id: string; created_at: Date }>('reaction_events'),
+  /** Desktop apps that checked in (one per install), with the admin's update request for each. */
+  appInstalls: c('app_installs'),
+  /** Desktop app versions uploaded by an admin (the single-file exe lives in the file store). */
+  appReleases: c('app_releases'),
+  /** Messages an admin sent to desktop apps, and which app showed / read each one. */
+  appNotifications: c('app_notifications'),
+  appNotificationReceipts: c('app_notification_receipts'),
 };
 
 /** Reserves `n` consecutive ids for a sequence and returns the first one. */
@@ -100,6 +107,10 @@ export async function ensureIndexes(): Promise<void> {
     ix(col.auditLog, [{ key: { id: -1 } }, { key: { action: 1, id: -1 } }]),
     ix(col.deletedMessages, [{ key: { workspace_id: 1, channel_id: 1, ts: 1 }, unique: true }]),
     ix(col.collectorCommands, [{ key: { id: 1 }, unique: true }, { key: { collector_id: 1, status: 1 } }]),
+    ix(col.appInstalls, [{ key: { id: 1 }, unique: true }, { key: { user_id: 1 } }, { key: { last_seen_at: -1 } }]),
+    ix(col.appReleases, [{ key: { version: 1 }, unique: true }]),
+    ix(col.appNotifications, [{ key: { id: 1 }, unique: true }, { key: { created_at: -1 } }]),
+    ix(col.appNotificationReceipts, [{ key: { notification_id: 1, install_id: 1 }, unique: true }, { key: { install_id: 1 } }]),
     ix(col.channelReads, [{ key: { app_user_id: 1, workspace_id: 1, channel_id: 1 }, unique: true }]),
     // Only needed while browsers may still send the same event: dropped after two days.
     ix(col.reactionEvents as unknown as Collection<Document>, [{ key: { created_at: 1 }, expireAfterSeconds: 2 * 86400 }]),
